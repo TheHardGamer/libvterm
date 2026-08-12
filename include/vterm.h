@@ -605,6 +605,12 @@ int vterm_screen_get_attrs_extent(const VTermScreen *screen, VTermRect *extent, 
 
 int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCell *cell);
 
+/* Efficiently copy an entire screen row into the provided buffer.
+ * Writes at most `maxcols` cells and returns the number written.
+ * Available since the row-copy optimization. */
+#define VTERM_HAS_SCREEN_GET_ROW 1
+int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *cells, int maxcols);
+
 int vterm_screen_is_eol(const VTermScreen *screen, VTermPos pos);
 
 /**

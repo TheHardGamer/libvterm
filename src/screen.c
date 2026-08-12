@@ -206,11 +206,48 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
   return 1;
 }
 
+INTERNAL int vterm_screen_putglyphs(VTermScreen *screen, VTermPos pos, const uint32_t *chars, int count, const VTermGlyphInfo *info)
+{
+  if(!screen || !chars || count <= 0)
+    return 0;
+
+  if(pos.row < 0 || pos.row >= screen->rows)
+    return 0;
+  if(pos.col < 0 || pos.col >= screen->cols)
+    return 0;
+
+  if(count > screen->cols - pos.col)
+    count = screen->cols - pos.col;
+
+  ScreenCell *rowstart = screen->buffer + (screen->cols * pos.row) + pos.col;
+
+  ScreenPen pen = screen->pen;
+  pen.protected_cell = info->protected_cell;
+  pen.dwl            = info->dwl;
+  pen.dhl            = info->dhl;
+
+  for(int i = 0; i < count; i++) {
+    ScreenCell *cell = rowstart + i;
+    cell->chars[0] = chars[i];
+    for(int j = 1; j < VTERM_MAX_CHARS_PER_CELL; j++)
+      cell->chars[j] = 0;
+    cell->pen = pen;
+  }
+
+  VTermRect rect = {
+    .start_row = pos.row,
+    .end_row   = pos.row + 1,
+    .start_col = pos.col,
+    .end_col   = pos.col + count,
+  };
+  damagerect(screen, rect);
+
+  return count;
+}
+
 static void sb_pushline_from_row(VTermScreen *screen, int row, bool continuation)
 {
-  VTermPos pos = { .row = row };
-  for(pos.col = 0; pos.col < screen->cols; pos.col++)
-    vterm_screen_get_cell(screen, pos, screen->sb_buffer + pos.col);
+  vterm_screen_get_row(screen, row, screen->sb_buffer, screen->cols);
 
   if(screen->callbacks_has_pushline4 && screen->callbacks->sb_pushline4)
     (screen->callbacks->sb_pushline4)(screen->cols, screen->sb_buffer, continuation, screen->cbdata);
@@ -1022,6 +1059,54 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
     cell->width = 1;
 
   return 1;
+}
+
+int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *cells, int maxcols)
+{
+  if(row < 0 || row >= screen->rows || !cells || maxcols <= 0)
+    return 0;
+
+  int limit = maxcols < screen->cols ? maxcols : screen->cols;
+
+  const ScreenCell *rowstart = screen->buffer + (screen->cols * row);
+
+  for(int col = 0; col < limit; col++) {
+    const ScreenCell *intcell = rowstart + col;
+
+    VTermScreenCell *cell = &cells[col];
+
+    int i;
+    for(i = 0; i < VTERM_MAX_CHARS_PER_CELL; i++) {
+      cell->chars[i] = intcell->chars[i];
+      if(!intcell->chars[i])
+        break;
+    }
+
+    cell->attrs.bold      = intcell->pen.bold;
+    cell->attrs.underline = intcell->pen.underline;
+    cell->attrs.italic    = intcell->pen.italic;
+    cell->attrs.blink     = intcell->pen.blink;
+    cell->attrs.reverse   = intcell->pen.reverse ^ screen->global_reverse;
+    cell->attrs.conceal   = intcell->pen.conceal;
+    cell->attrs.strike    = intcell->pen.strike;
+    cell->attrs.font      = intcell->pen.font;
+    cell->attrs.small     = intcell->pen.small;
+    cell->attrs.baseline  = intcell->pen.baseline;
+
+    cell->attrs.dwl = intcell->pen.dwl;
+    cell->attrs.dhl = intcell->pen.dhl;
+
+    cell->fg = intcell->pen.fg;
+    cell->bg = intcell->pen.bg;
+
+    if(col < (screen->cols - 1) &&
+       (rowstart + col + 1)->chars[0] == (uint32_t)-1)
+      cell->width = 2;
+    else
+      cell->width = 1;
+  }
+
+  return limit;
 }
 
 int vterm_screen_is_eol(const VTermScreen *screen, VTermPos pos)

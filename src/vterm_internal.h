@@ -290,6 +290,11 @@ void vterm_state_push_output_sprintf_CSI(VTermState *vts, const char *format, ..
 
 void vterm_screen_free(VTermScreen *screen);
 
+/* Batch-put width-1 glyphs starting at pos.  The chars array must hold `count`
+ * codepoints; info supplies attributes that are constant across the run.
+ * Returns the number of glyphs actually written.  Internal optimization. */
+INTERNAL int vterm_screen_putglyphs(VTermScreen *screen, VTermPos pos, const uint32_t *chars, int count, const VTermGlyphInfo *info);
+
 VTermEncoding *vterm_lookup_encoding(VTermEncodingType type, char designation);
 
 int vterm_unicode_width(uint32_t codepoint);

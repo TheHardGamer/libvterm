@@ -297,6 +297,120 @@ static void set_lineinfo(VTermState *state, int row, int force, int dwl, int dhl
     state->lineinfo[row] = info;
 }
 
+static inline int is_simple_codepoint(uint32_t cp)
+{
+  /* Printable ASCII: width 1 and not combining */
+  return cp >= 0x20 && cp <= 0x7e;
+}
+
+/* Fast path for runs of simple width-1 glyphs.  Writes directly to the screen
+ * buffer (bypassing the per-glyph callback) when the terminal has obtained a
+ * screen and all conditions (no insert mode, no double-width/height line, etc.)
+ * hold.  Returns the number of codepoints consumed. */
+static int batch_simple_text(VTermState *state, const uint32_t *codepoints, int npoints, int start)
+{
+  int i = start;
+  int total = 0;
+
+  uint32_t last_char = 0;
+  VTermPos last_glyph_pos = { 0, 0 };
+
+  while(i < npoints) {
+    if(!is_simple_codepoint(codepoints[i]))
+      break;
+
+    if(state->mode.insert)
+      break;
+
+    if(!state->vt->screen)
+      break;
+
+    if(state->lineinfo[state->pos.row].doublewidth || state->lineinfo[state->pos.row].doubleheight)
+      break;
+
+    if(state->at_phantom) {
+      linefeed(state);
+      state->pos.col = 0;
+      state->at_phantom = 0;
+      state->lineinfo[state->pos.row].continuation = 1;
+
+      if(state->lineinfo[state->pos.row].doublewidth || state->lineinfo[state->pos.row].doubleheight)
+        break;
+    }
+
+    int row_width = THISROWWIDTH(state);
+    if(state->pos.col < 0 || state->pos.col >= row_width)
+      break;
+
+    int remaining = row_width - state->pos.col;
+    int max_run = npoints - i;
+    if(max_run > remaining)
+      max_run = remaining;
+
+    int run_len = 0;
+    for(; run_len < max_run && is_simple_codepoint(codepoints[i + run_len]); run_len++)
+      ;
+
+    if(run_len == 0)
+      break;
+
+    VTermPos pos = { state->pos.row, state->pos.col };
+    VTermGlyphInfo info = {
+      .chars = NULL,
+      .width = 1,
+      .protected_cell = state->protected_cell,
+      .dwl = state->lineinfo[state->pos.row].doublewidth,
+      .dhl = state->lineinfo[state->pos.row].doubleheight,
+    };
+
+    int written = vterm_screen_putglyphs(state->vt->screen, pos, codepoints + i, run_len, &info);
+    if(written != run_len)
+      break;
+
+    i += run_len;
+    total += run_len;
+
+    /* Position of the last glyph we just wrote, before advancing the cursor. */
+    last_glyph_pos.row = pos.row;
+    last_glyph_pos.col = pos.col + run_len - 1;
+    last_char = codepoints[i - 1];
+
+    int next_col = pos.col + run_len;
+    if(next_col >= row_width) {
+      if(state->mode.autowrap) {
+        state->at_phantom = 1;
+        state->pos.col = row_width - 1;
+
+        if(i < npoints && is_simple_codepoint(codepoints[i])) {
+          linefeed(state);
+          state->pos.col = 0;
+          state->at_phantom = 0;
+          state->lineinfo[state->pos.row].continuation = 1;
+          continue;
+        }
+        break;
+      }
+      else {
+        state->pos.col = row_width - 1;
+        break;
+      }
+    }
+    else {
+      state->pos.col = next_col;
+    }
+  }
+
+  if(total > 0 && i == npoints) {
+    /* Save the last glyph in case the next input starts with combining chars */
+    state->combine_chars[0] = last_char;
+    state->combine_chars[1] = 0;
+    state->combine_width = 1;
+    state->combine_pos = last_glyph_pos;
+  }
+
+  return total;
+}
+
 static int on_text(const char bytes[], size_t len, void *user)
 {
   VTermState *state = user;
@@ -373,6 +487,14 @@ static int on_text(const char bytes[], size_t len, void *user)
   }
 
   for(; i < npoints; i++) {
+    /* Fast path: batch a run of simple width-1 glyphs directly into the
+     * screen buffer, avoiding per-glyph callback overhead. */
+    int batched = batch_simple_text(state, codepoints, npoints, i);
+    if(batched > 0) {
+      i += batched - 1;
+      continue;
+    }
+
     // Try to find combining characters following this
     int glyph_starts = i;
     int glyph_ends;
