@@ -1106,6 +1106,29 @@ size_t vterm_screen_get_text(const VTermScreen *screen, char *str, size_t len, c
   return _get_chars(screen, 1, str, len, rect);
 }
 
+/* Copy the pen attributes from an internal ScreenPen to a public VTermScreenCell.
+ * This is a separate helper because vterm_screen_get_row reuses the same
+ * attributes for runs of identical cells. */
+static inline void set_public_attrs(VTermScreenCell *cell, const ScreenPen *pen, int global_reverse)
+{
+  cell->attrs.bold      = pen->bold;
+  cell->attrs.underline = pen->underline;
+  cell->attrs.italic    = pen->italic;
+  cell->attrs.blink     = pen->blink;
+  cell->attrs.reverse   = pen->reverse ^ global_reverse;
+  cell->attrs.conceal   = pen->conceal;
+  cell->attrs.strike    = pen->strike;
+  cell->attrs.font      = pen->font;
+  cell->attrs.small     = pen->small;
+  cell->attrs.baseline  = pen->baseline;
+
+  cell->attrs.dwl = pen->dwl;
+  cell->attrs.dhl = pen->dhl;
+
+  cell->fg = pen->fg;
+  cell->bg = pen->bg;
+}
+
 /* Copy internal to external representation of a screen cell */
 int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCell *cell)
 {
@@ -1119,22 +1142,7 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
       break;
   }
 
-  cell->attrs.bold      = intcell->pen.bold;
-  cell->attrs.underline = intcell->pen.underline;
-  cell->attrs.italic    = intcell->pen.italic;
-  cell->attrs.blink     = intcell->pen.blink;
-  cell->attrs.reverse   = intcell->pen.reverse ^ screen->global_reverse;
-  cell->attrs.conceal   = intcell->pen.conceal;
-  cell->attrs.strike    = intcell->pen.strike;
-  cell->attrs.font      = intcell->pen.font;
-  cell->attrs.small     = intcell->pen.small;
-  cell->attrs.baseline  = intcell->pen.baseline;
-
-  cell->attrs.dwl = intcell->pen.dwl;
-  cell->attrs.dhl = intcell->pen.dhl;
-
-  cell->fg = intcell->pen.fg;
-  cell->bg = intcell->pen.bg;
+  set_public_attrs(cell, &intcell->pen, screen->global_reverse);
 
   if(pos.col < (screen->cols - 1) &&
      getcell(screen, pos.row, pos.col + 1)->chars[0] == (uint32_t)-1)
@@ -1153,10 +1161,12 @@ int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *ce
   int limit = maxcols < screen->cols ? maxcols : screen->cols;
 
   const ScreenCell *rowstart = screen->row_ptrs_active[row];
+  const ScreenPen *last_pen = NULL;
+  VTermScreenCell cached;
+  int global_reverse = screen->global_reverse;
 
   for(int col = 0; col < limit; col++) {
     const ScreenCell *intcell = rowstart + col;
-
     VTermScreenCell *cell = &cells[col];
 
     int i;
@@ -1166,22 +1176,17 @@ int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *ce
         break;
     }
 
-    cell->attrs.bold      = intcell->pen.bold;
-    cell->attrs.underline = intcell->pen.underline;
-    cell->attrs.italic    = intcell->pen.italic;
-    cell->attrs.blink     = intcell->pen.blink;
-    cell->attrs.reverse   = intcell->pen.reverse ^ screen->global_reverse;
-    cell->attrs.conceal   = intcell->pen.conceal;
-    cell->attrs.strike    = intcell->pen.strike;
-    cell->attrs.font      = intcell->pen.font;
-    cell->attrs.small     = intcell->pen.small;
-    cell->attrs.baseline  = intcell->pen.baseline;
-
-    cell->attrs.dwl = intcell->pen.dwl;
-    cell->attrs.dhl = intcell->pen.dhl;
-
-    cell->fg = intcell->pen.fg;
-    cell->bg = intcell->pen.bg;
+    if(!last_pen || memcmp(&intcell->pen, last_pen, sizeof(ScreenPen)) != 0) {
+      set_public_attrs(cell, &intcell->pen, global_reverse);
+      last_pen = &intcell->pen;
+      cached.attrs = cell->attrs;
+      cached.fg = cell->fg;
+      cached.bg = cell->bg;
+    } else {
+      cell->attrs = cached.attrs;
+      cell->fg = cached.fg;
+      cell->bg = cached.bg;
+    }
 
     if(col < (screen->cols - 1) &&
        (rowstart + col + 1)->chars[0] == (uint32_t)-1)
