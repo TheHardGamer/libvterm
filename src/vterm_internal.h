@@ -121,6 +121,7 @@ struct VTermState
     unsigned int leftrightmargin:1;
     unsigned int bracketpaste:1;
     unsigned int report_focus:1;
+    unsigned int sync_output:1; /* DECSET 2026 tracking */
   } mode;
 
   VTermEncodingInstance encoding[4], encoding_utf8;

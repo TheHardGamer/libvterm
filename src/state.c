@@ -984,6 +984,11 @@ static void set_dec_mode(VTermState *state, int num, int val)
     state->mode.bracketpaste = val;
     break;
 
+  case 2026: // Patch: Intercept Synchronized Output Mode
+    state->mode.sync_output = val;
+    settermprop_bool(state, VTERM_PROP_SYNCOUTPUT, val);
+    break;
+
   default:
     DEBUG_LOG("libvterm: Unknown DEC mode %d\n", num);
     return;

@@ -79,6 +79,7 @@ struct VTermScreen
   VTermScreenCell *sb_buffer;
 
   ScreenPen pen;
+  bool mode_synchronized; /* track current sync state */
 };
 
 static inline void clearcell(const VTermScreen *screen, ScreenCell *cell)
@@ -118,6 +119,8 @@ static void alloc_buffer(VTermScreen *screen, int bufidx, int rows, int cols)
 
 static void damagerect(VTermScreen *screen, VTermRect rect)
 {
+  if (screen->mode_synchronized)
+    return;
   VTermRect emit;
 
   switch(screen->damage_merge) {
@@ -576,6 +579,13 @@ static int settermprop(VTermProp prop, VTermValue *val, void *user)
   case VTERM_PROP_REVERSE:
     screen->global_reverse = val->boolean;
     damagescreen(screen);
+    break;
+  case VTERM_PROP_SYNCOUTPUT: // Handle Synchronized Output Mode updates
+    screen->mode_synchronized = val->boolean;
+    if(!val->boolean) {
+      /* Mode disabled: paint the complete updated state to your emulator canvas */
+      damagescreen(screen);
+    }
     break;
   default:
     ; /* ignore */
