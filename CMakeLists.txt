@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(vterm VERSION 0.3.3 LANGUAGES C)
-
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 set(VERSION_CURRENT 0)
 set(VERSION_REVISION 0)
 set(VERSION_AGE 0)
@@ -8,7 +8,7 @@ set(VERSION_AGE 0)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_compile_options(-Wall -Wpedantic)
+add_compile_options(-Wall -Wpedantic -O3)
 
 if(CMAKE_SYSTEM_NAME MATCHES "SunOS")
     add_compile_definitions(__EXTENSIONS__ _XPG6 __XOPEN_OR_POSIX)
