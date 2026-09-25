@@ -301,11 +301,25 @@ static const struct interval fullwidth[] = {
 
 INTERNAL int vterm_unicode_width(uint32_t codepoint)
 {
+  /* Fast-path for everything below the first possible fullwidth character (U+1100) */
+  if (codepoint < 0x1100) {
+    /* Instantly return 1 for printable ASCII (0x20-0x7E) and printable Latin-1 (0xA0-0xFF) */
+    if ((codepoint >= 0x20 && codepoint <= 0x7E) ||
+        (codepoint >= 0xA0 && codepoint <= 0xFF)) {
+      return 1;
+    }
+
+    /* Fallback directly to mk_wcwidth for control codes/combining marks, skipping bisearch */
+    return mk_wcwidth(codepoint);
+  }
+
+  /* Only run the heavy wide-table binary search for characters that could actually be CJK/Wide */
   if(bisearch(codepoint, fullwidth, sizeof(fullwidth) / sizeof(fullwidth[0]) - 1))
     return 2;
 
   return mk_wcwidth(codepoint);
 }
+
 
 INTERNAL int vterm_unicode_is_combining(uint32_t codepoint)
 {
