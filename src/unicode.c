@@ -1,5 +1,7 @@
 #include "vterm_internal.h"
 
+#include <stdlib.h>
+
 // ### The following from http://www.cl.cam.ac.uk/~mgk25/ucs/wcwidth.c
 // With modifications:
 //   made functions static
@@ -299,7 +301,7 @@ static const struct interval fullwidth[] = {
 #include "fullwidth.inc"
 };
 
-INTERNAL int vterm_unicode_width(uint32_t codepoint)
+static int unicode_width_slow(uint32_t codepoint)
 {
   /* Fast-path for everything below the first possible fullwidth character (U+1100) */
   if (codepoint < 0x1100) {
@@ -320,8 +322,74 @@ INTERNAL int vterm_unicode_width(uint32_t codepoint)
   return mk_wcwidth(codepoint);
 }
 
+static int unicode_is_combining_slow(uint32_t codepoint)
+{
+  return bisearch(codepoint, combining, sizeof(combining) / sizeof(struct interval) - 1);
+}
+
+/* Lookup tables, filled one 256-codepoint block at a time the first time that
+ * block is used. A lookup is then two loads instead of a pair of binary
+ * searches. Entry: bits 0-1 = width + 1 (so -1 for control characters fits),
+ * bit 2 = combining. A block is fully built before its pointer is published,
+ * so a race between two threads only costs a duplicate (leaked) block. */
+#define UNICODE_BLOCKS (0x110000 >> 8)
+static uint8_t *unicode_blocks[UNICODE_BLOCKS];
+
+static const uint8_t *unicode_fill_block(uint32_t block)
+{
+  uint8_t *b = malloc(256);
+  if(!b)
+    return NULL;
+
+  for(uint32_t i = 0; i < 256; i++) {
+    uint32_t cp = (block << 8) | i;
+    int w = unicode_width_slow(cp);
+    if(w < -1) w = -1;
+    if(w > 2)  w = 2;
+    b[i] = (uint8_t)((w + 1) | (unicode_is_combining_slow(cp) ? 4 : 0));
+  }
+
+  unicode_blocks[block] = b;
+  return b;
+}
+
+static inline int unicode_info(uint32_t codepoint)
+{
+  if(codepoint >= 0x110000)
+    return -1;
+
+  const uint8_t *b = unicode_blocks[codepoint >> 8];
+  if(!b) {
+    b = unicode_fill_block(codepoint >> 8);
+    if(!b)
+      return -1;
+  }
+  return b[codepoint & 0xff];
+}
+
+INTERNAL int vterm_unicode_width(uint32_t codepoint)
+{
+  int info = unicode_info(codepoint);
+  if(info < 0)
+    return unicode_width_slow(codepoint);
+  return (info & 3) - 1;
+}
 
 INTERNAL int vterm_unicode_is_combining(uint32_t codepoint)
 {
-  return bisearch(codepoint, combining, sizeof(combining) / sizeof(struct interval) - 1);
+  /* Nothing below U+0300 combines, which covers practically all terminal text */
+  if(codepoint < 0x300)
+    return 0;
+
+  int info = unicode_info(codepoint);
+  if(info < 0)
+    return unicode_is_combining_slow(codepoint);
+  return (info >> 2) & 1;
+}
+
+/* Width 1 and not combining: such a character can be written straight into a
+ * cell without any further processing. */
+INTERNAL int vterm_unicode_is_plain(uint32_t codepoint)
+{
+  return unicode_info(codepoint) == 2; /* width + 1 == 2, combining bit clear */
 }

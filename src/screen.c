@@ -49,6 +49,7 @@ struct VTermScreen
   const VTermScreenCallbacks *callbacks;
   void *cbdata;
   bool callbacks_has_pushline4;
+  bool sb_trim; /* hand trailing blank cells to sb_pushline as absent, see vterm_screen_set_sb_trim() */
 
   VTermDamageSize damage_merge;
   /* start_row == -1 => no damage */
@@ -82,9 +83,11 @@ struct VTermScreen
   bool mode_synchronized; /* track current sync state */
 };
 
+/* Invariant: every entry of ScreenCell.chars after the first 0 is also 0, so
+ * a whole cell can be copied without looking for the terminator. */
 static inline void clearcell(const VTermScreen *screen, ScreenCell *cell)
 {
-  cell->chars[0] = 0;
+  memset(cell->chars, 0, sizeof(cell->chars));
   cell->pen = screen->pen;
 }
 
@@ -201,11 +204,14 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
     cell->chars[i] = info->chars[i];
     cell->pen = screen->pen;
   }
-  if(i < VTERM_MAX_CHARS_PER_CELL)
+  for( ; i < VTERM_MAX_CHARS_PER_CELL; i++)
     cell->chars[i] = 0;
 
-  for(int col = 1; col < info->width; col++)
-    getcell(screen, pos.row, pos.col + col)->chars[0] = (uint32_t)-1;
+  for(int col = 1; col < info->width; col++) {
+    ScreenCell *gap = getcell(screen, pos.row, pos.col + col);
+    memset(gap->chars, 0, sizeof(gap->chars));
+    gap->chars[0] = (uint32_t)-1;
+  }
 
   VTermRect rect = {
     .start_row = pos.row,
@@ -262,14 +268,31 @@ INTERNAL int vterm_screen_putglyphs(VTermScreen *screen, VTermPos pos, const uin
   return count;
 }
 
+/* A trailing cell that shows nothing: no character, default background, and no
+ * attribute that draws on an empty cell. */
+static inline bool cell_is_blank_tail(const ScreenCell *cell)
+{
+  return cell->chars[0] == 0 &&
+         VTERM_COLOR_IS_DEFAULT_BG(&cell->pen.bg) &&
+         !cell->pen.reverse && !cell->pen.underline && !cell->pen.strike;
+}
+
 static void sb_pushline_from_row(VTermScreen *screen, int row, bool continuation)
 {
-  vterm_screen_get_row(screen, row, screen->sb_buffer, screen->cols);
+  int cols = screen->cols;
+
+  if(screen->sb_trim && !screen->global_reverse) {
+    const ScreenCell *rowstart = screen->row_ptrs_active[row];
+    while(cols > 0 && cell_is_blank_tail(rowstart + cols - 1))
+      cols--;
+  }
+
+  vterm_screen_get_row(screen, row, screen->sb_buffer, cols);
 
   if(screen->callbacks_has_pushline4 && screen->callbacks->sb_pushline4)
-    (screen->callbacks->sb_pushline4)(screen->cols, screen->sb_buffer, continuation, screen->cbdata);
+    (screen->callbacks->sb_pushline4)(cols, screen->sb_buffer, continuation, screen->cbdata);
   else
-    (screen->callbacks->sb_pushline)(screen->cols, screen->sb_buffer, screen->cbdata);
+    (screen->callbacks->sb_pushline)(cols, screen->sb_buffer, screen->cbdata);
 }
 
 static int premove(VTermRect rect, void *user)
@@ -374,27 +397,48 @@ static int moverect_user(VTermRect dest, VTermRect src, void *user)
   return 1;
 }
 
+/* Fill n cells from one template by doubling memcpy()s. Much cheaper than
+ * assigning a compound literal per cell. */
+static void fill_cells(ScreenCell *dst, int n, const ScreenCell *tmpl)
+{
+  if(n <= 0)
+    return;
+
+  dst[0] = *tmpl;
+  for(int filled = 1; filled < n; filled *= 2) {
+    int chunk = filled < n - filled ? filled : n - filled;
+    memcpy(dst + filled, dst, (size_t)chunk * sizeof(ScreenCell));
+  }
+}
+
 static int erase_internal(VTermRect rect, int selective, void *user)
 {
   VTermScreen *screen = user;
 
+  ScreenCell blank;
+  memset(&blank, 0, sizeof(blank));
+  /* Only copy .fg and .bg; leave things like rv in reset state */
+  blank.pen.fg = screen->pen.fg;
+  blank.pen.bg = screen->pen.bg;
+
   for(int row = rect.start_row; row < screen->state->rows && row < rect.end_row; row++) {
     const VTermLineInfo *info = vterm_state_get_lineinfo(screen->state, row);
+
+    blank.pen.dwl = info->doublewidth;
+    blank.pen.dhl = info->doubleheight;
+
+    if(!selective) {
+      fill_cells(getcell(screen, row, rect.start_col), rect.end_col - rect.start_col, &blank);
+      continue;
+    }
 
     for(int col = rect.start_col; col < rect.end_col; col++) {
       ScreenCell *cell = getcell(screen, row, col);
 
-      if(selective && cell->pen.protected_cell)
+      if(cell->pen.protected_cell)
         continue;
 
-      cell->chars[0] = 0;
-      cell->pen = (ScreenPen){
-        /* Only copy .fg and .bg; leave things like rv in reset state */
-        .fg = screen->pen.fg,
-        .bg = screen->pen.bg,
-      };
-      cell->pen.dwl = info->doublewidth;
-      cell->pen.dhl = info->doubleheight;
+      *cell = blank;
     }
   }
 
@@ -814,10 +858,12 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
         VTermScreenCell *src = &screen->sb_buffer[pos.col];
         ScreenCell *dst = &new_buffer[pos.row * new_cols + pos.col];
 
-        for(int i = 0; i < VTERM_MAX_CHARS_PER_CELL; i++) {
-          dst->chars[i] = src->chars[i];
-          if(!src->chars[i])
-            break;
+        {
+          int i = 0;
+          for( ; i < VTERM_MAX_CHARS_PER_CELL && src->chars[i]; i++)
+            dst->chars[i] = src->chars[i];
+          for( ; i < VTERM_MAX_CHARS_PER_CELL; i++)
+            dst->chars[i] = 0;
         }
 
         dst->pen.bold      = src->attrs.bold;
@@ -834,8 +880,10 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
         dst->pen.fg = src->fg;
         dst->pen.bg = src->bg;
 
-        if(src->width == 2 && pos.col < (new_cols-1))
+        if(src->width == 2 && pos.col < (new_cols-1)) {
+          memset((dst + 1)->chars, 0, sizeof((dst + 1)->chars));
           (dst + 1)->chars[0] = (uint32_t) -1;
+        }
       }
       for( ; pos.col < new_cols; pos.col++)
         clearcell(screen, &new_buffer[pos.row * new_cols + pos.col]);
@@ -1179,12 +1227,8 @@ int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *ce
     const ScreenCell *intcell = rowstart + col;
     VTermScreenCell *cell = &cells[col];
 
-    int i;
-    for(i = 0; i < VTERM_MAX_CHARS_PER_CELL; i++) {
-      cell->chars[i] = intcell->chars[i];
-      if(!intcell->chars[i])
-        break;
-    }
+    /* Internal cells keep unused chars[] entries zeroed, so copy them all. */
+    memcpy(cell->chars, intcell->chars, sizeof(cell->chars));
 
     if(!last_pen || memcmp(&intcell->pen, last_pen, sizeof(ScreenPen)) != 0) {
       set_public_attrs(cell, &intcell->pen, global_reverse);
@@ -1229,6 +1273,11 @@ VTermScreen *vterm_obtain_screen(VTerm *vt)
   vt->screen = screen;
 
   return screen;
+}
+
+void vterm_screen_set_sb_trim(VTermScreen *screen, bool trim)
+{
+  screen->sb_trim = trim;
 }
 
 void vterm_screen_enable_reflow(VTermScreen *screen, bool reflow)

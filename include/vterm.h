@@ -562,6 +562,14 @@ void *vterm_screen_get_unrecognised_fbdata(VTermScreen *screen);
 
 void vterm_screen_enable_reflow(VTermScreen *screen, bool reflow);
 
+/**
+ * When enabled, lines handed to sb_pushline / sb_pushline4 end at the last cell
+ * that shows anything: trailing blank cells are left out and `cols` is the
+ * shortened width. Off by default, in which case `cols` is always the full width.
+ */
+void vterm_screen_set_sb_trim(VTermScreen *screen, bool trim);
+#define VTERM_HAS_SB_TRIM 1
+
 // Back-compat alias for the brief time it was in 0.3-RC1
 #define vterm_screen_set_reflow  vterm_screen_enable_reflow
 

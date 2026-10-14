@@ -1,5 +1,6 @@
 #include "vterm_internal.h"
 
+
 #include <stdio.h>
 #include <string.h>
 
@@ -299,8 +300,10 @@ static void set_lineinfo(VTermState *state, int row, int force, int dwl, int dhl
 
 static inline int is_simple_codepoint(uint32_t cp)
 {
-  /* Printable ASCII: width 1 and not combining */
-  return cp >= 0x20 && cp <= 0x7e;
+  /* Printable ASCII, or any other width-1 character that doesn't combine */
+  if(cp < 0x80)
+    return cp >= 0x20 && cp <= 0x7e;
+  return cp >= 0xa0 && vterm_unicode_is_plain(cp);
 }
 
 /* Fast path for runs of simple width-1 glyphs.  Writes directly to the screen
@@ -350,6 +353,11 @@ static int batch_simple_text(VTermState *state, const uint32_t *codepoints, int 
     int run_len = 0;
     for(; run_len < max_run && is_simple_codepoint(codepoints[i + run_len]); run_len++)
       ;
+
+    /* A combining mark right after the run attaches to the run's last
+     * character, so that character has to take the slow path with it. */
+    if(run_len > 0 && i + run_len < npoints && vterm_unicode_is_combining(codepoints[i + run_len]))
+      run_len--;
 
     if(run_len == 0)
       break;
@@ -410,6 +418,7 @@ static int batch_simple_text(VTermState *state, const uint32_t *codepoints, int 
 
   return total;
 }
+
 
 static int on_text(const char bytes[], size_t len, void *user)
 {
