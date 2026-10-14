@@ -1,5 +1,9 @@
 #include "vterm_internal.h"
 
+#include <limits.h>
+
+#define CSI_ARG_LIMIT 2000000L
+
 #include <stdio.h>
 #include <string.h>
 
@@ -222,8 +226,17 @@ size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
       if(c >= '0' && c <= '9') {
         if(vt->parser.v.csi.args[vt->parser.v.csi.argi] == CSI_ARG_MISSING)
           vt->parser.v.csi.args[vt->parser.v.csi.argi] = 0;
-        vt->parser.v.csi.args[vt->parser.v.csi.argi] *= 10;
-        vt->parser.v.csi.args[vt->parser.v.csi.argi] += c - '0';
+        {
+          /* Numbers saturate at CSI_ARG_LIMIT instead of overflowing. The limit
+           * is far above any real parameter (Unicode tops out at 1114111) yet
+           * small enough that adding one to a cursor position can't overflow. */
+          long *arg = &vt->parser.v.csi.args[vt->parser.v.csi.argi];
+          long digit = c - '0';
+          if(*arg > (CSI_ARG_LIMIT - digit) / 10)
+            *arg = CSI_ARG_LIMIT;
+          else
+            *arg = *arg * 10 + digit;
+        }
         break;
       }
       if(c == ':') {
@@ -263,9 +276,10 @@ size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
       if(c >= '0' && c <= '9') {
         if(vt->parser.v.osc.command == -1)
           vt->parser.v.osc.command = 0;
-        else
-          vt->parser.v.osc.command *= 10;
-        vt->parser.v.osc.command += c - '0';
+        /* Saturate instead of overflowing on absurdly long numbers */
+        if(vt->parser.v.osc.command > (INT_MAX - 9) / 10)
+          vt->parser.v.osc.command = (INT_MAX - 9) / 10;
+        vt->parser.v.osc.command = vt->parser.v.osc.command * 10 + (c - '0');
         break;
       }
       if(c == ';') {

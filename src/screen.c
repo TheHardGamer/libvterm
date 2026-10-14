@@ -207,8 +207,15 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
   for( ; i < VTERM_MAX_CHARS_PER_CELL; i++)
     cell->chars[i] = 0;
 
-  for(int col = 1; col < info->width; col++) {
+  int width = info->width;
+  for(int col = 1; col < width; col++) {
     ScreenCell *gap = getcell(screen, pos.row, pos.col + col);
+    if(!gap) {
+      /* A wide glyph wider than what is left of the row (e.g. on a 1-column
+       * screen): only the part that exists gets written. */
+      width = col;
+      break;
+    }
     memset(gap->chars, 0, sizeof(gap->chars));
     gap->chars[0] = (uint32_t)-1;
   }
@@ -217,7 +224,7 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
     .start_row = pos.row,
     .end_row   = pos.row+1,
     .start_col = pos.col,
-    .end_col   = pos.col+info->width,
+    .end_col   = pos.col+width,
   };
 
   cell->pen.protected_cell = info->protected_cell;

@@ -1,0 +1,52 @@
+INIT
+UTF8 1
+WANTSTATE
+
+# Regression tests for crashes, hangs and undefined behaviour found by fuzzing
+
+!Restoring a saved cursor after the screen shrank keeps it on screen
+RESET
+PUSH "\e[20;60H"
+  ?cursor = 19,59
+PUSH "\e7"
+RESIZE 10,40
+PUSH "\e8"
+  ?cursor = 9,39
+RESIZE 25,80
+
+!Shrinking the screen resets a scroll region that no longer fits
+RESET
+PUSH "\e[10;20r"
+RESIZE 5,80
+PUSH "\e[5;1H\n\n\n"
+  ?cursor = 4,0
+RESIZE 25,80
+
+!A wide character on a one-column screen does not write outside it
+RESET
+RESIZE 5,1
+PUSH "\xEF\xBC\x90\xEF\xBC\x90"
+RESIZE 25,80
+
+!Absurdly long CSI numbers saturate instead of overflowing
+RESET
+PUSH "\e[10;10H"
+  ?cursor = 9,9
+PUSH "\e[99999999999999999999A"
+  ?cursor = 0,9
+PUSH "\e[99999999999999999999C"
+  ?cursor = 0,79
+
+!Absurdly long OSC numbers are ignored without overflowing
+RESET
+PUSH "\e]99999999999999999999;x\a"
+PUSH "A"
+  ?cursor = 0,1
+
+!Double-width lines on a one-column screen keep the cursor on screen
+RESET
+RESIZE 5,1
+PUSH "\e#6"
+PUSH "abc\r\n"
+  ?cursor = 3,0
+RESIZE 25,80

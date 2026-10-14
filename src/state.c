@@ -79,6 +79,7 @@ static VTermState *vterm_state_new(VTerm *vt)
   state->selection.callbacks = NULL;
   state->selection.user      = NULL;
   state->selection.buffer    = NULL;
+  state->selection.buffer_owned = false;
 
   vterm_state_newpen(state);
 
@@ -108,6 +109,8 @@ INTERNAL void vterm_state_free(VTermState *state)
   if(state->lineinfos[BUFIDX_ALTSCREEN])
     vterm_allocator_free(state->vt, state->lineinfos[BUFIDX_ALTSCREEN]);
   vterm_allocator_free(state->vt, state->combine_chars);
+  if(state->selection.buffer_owned)
+    vterm_allocator_free(state->vt, state->selection.buffer);
   vterm_allocator_free(state->vt, state);
 }
 
@@ -591,6 +594,12 @@ static int on_text(const char bytes[], size_t len, void *user)
     }
   }
 
+  /* Never leave the cursor outside the screen, whatever the line width was */
+  if(state->pos.col < 0)
+    state->pos.col = 0;
+  if(state->pos.col >= state->cols)
+    state->pos.col = state->cols - 1;
+
   updatecursor(state, &oldpos, 0);
 
 #ifdef DEBUG
@@ -736,6 +745,16 @@ static void savecursor(VTermState *state, int save)
     VTermPos oldpos = state->pos;
 
     state->pos = state->saved.pos;
+
+    /* The screen may have been resized since the cursor was saved */
+    if(state->pos.row < 0)
+      state->pos.row = 0;
+    if(state->pos.row >= state->rows)
+      state->pos.row = state->rows - 1;
+    if(state->pos.col < 0)
+      state->pos.col = 0;
+    if(state->pos.col >= ROWWIDTH(state, state->pos.row))
+      state->pos.col = ROWWIDTH(state, state->pos.row) - 1;
 
     settermprop_bool(state, VTERM_PROP_CURSORVISIBLE, state->saved.mode.cursor_visible);
     settermprop_bool(state, VTERM_PROP_CURSORBLINK,   state->saved.mode.cursor_blink);
@@ -1073,6 +1092,10 @@ static void request_dec_mode(VTermState *state, int num)
       reply = state->mode.bracketpaste;
       break;
 
+    case 2026:
+      reply = state->mode.sync_output;
+      break;
+
     default:
       vterm_push_output_sprintf_ctrl(state->vt, C1_CSI, "?%d;%d$y", num, 0);
       return;
@@ -1396,6 +1419,10 @@ static int on_csi(const char *leader, const long args[], int argcount, const cha
   case 0x62: { // REP - ECMA-48 8.3.103
     const int row_width = THISROWWIDTH(state);
     count = CSI_ARG_COUNT(args[0]);
+    /* Nothing to repeat after a zero-width character; without this the loop
+     * below would never advance the cursor. */
+    if(state->combine_width <= 0)
+      break;
     col = state->pos.col + count;
     UBOUND(col, row_width);
     while (state->pos.col < col) {
@@ -2148,6 +2175,17 @@ static int on_resize(int rows, int cols, void *user)
   if(state->scrollregion_right > -1)
     UBOUND(state->scrollregion_right, state->cols);
 
+  /* A smaller screen can leave the region empty or inverted; fall back to the
+   * whole screen, as DECSTBM does for an invalid region */
+  if(state->scrollregion_top >= SCROLLREGION_BOTTOM(state)) {
+    state->scrollregion_top    = 0;
+    state->scrollregion_bottom = -1;
+  }
+  if(state->scrollregion_right > -1 && state->scrollregion_left >= state->scrollregion_right) {
+    state->scrollregion_left  = 0;
+    state->scrollregion_right = -1;
+  }
+
   VTermStateFields fields = {
     .pos       = state->pos,
     .lineinfos = { [0] = state->lineinfos[0], [1] = state->lineinfos[1] },
@@ -2397,6 +2435,9 @@ int vterm_state_set_termprop(VTermState *state, VTermProp prop, VTermValue *val)
   case VTERM_PROP_FOCUSREPORT:
     state->mode.report_focus = val->boolean;
     return 1;
+  case VTERM_PROP_SYNCOUTPUT:
+    state->mode.sync_output = val->boolean;
+    return 1;
 
   case VTERM_N_PROPS:
     return 0;
@@ -2425,13 +2466,21 @@ const VTermLineInfo *vterm_state_get_lineinfo(const VTermState *state, int row)
 void vterm_state_set_selection_callbacks(VTermState *state, const VTermSelectionCallbacks *callbacks, void *user,
     char *buffer, size_t buflen)
 {
-  if(buflen && !buffer)
-    buffer = vterm_allocator_malloc(state->vt, buflen);
+  /* Drop a buffer we allocated for an earlier call */
+  if(state->selection.buffer_owned)
+    vterm_allocator_free(state->vt, state->selection.buffer);
 
-  state->selection.callbacks = callbacks;
-  state->selection.user      = user;
-  state->selection.buffer    = buffer;
-  state->selection.buflen    = buflen;
+  bool owned = false;
+  if(buflen && !buffer) {
+    buffer = vterm_allocator_malloc(state->vt, buflen);
+    owned = true;
+  }
+
+  state->selection.callbacks    = callbacks;
+  state->selection.user         = user;
+  state->selection.buffer       = buffer;
+  state->selection.buflen       = buflen;
+  state->selection.buffer_owned = owned;
 }
 
 void vterm_state_send_selection(VTermState *state, VTermSelectionMask mask, VTermStringFragment frag)

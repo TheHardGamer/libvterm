@@ -61,3 +61,14 @@ PUSH "\e G"
 PUSH "\e[5n"
   output "\x{9b}0n"
 PUSH "\e F"
+
+!DECRQM reports synchronized output (2026)
+RESET
+PUSH "\e[?2026\$p"
+  output "\e[?2026;2\$y"
+PUSH "\e[?2026h"
+PUSH "\e[?2026\$p"
+  output "\e[?2026;1\$y"
+PUSH "\e[?2026l"
+PUSH "\e[?2026\$p"
+  output "\e[?2026;2\$y"

@@ -87,7 +87,8 @@ struct VTermState
 
   /* lineinfo will == lineinfos[0] or lineinfos[1], depending on altscreen */
   VTermLineInfo *lineinfo;
-#define ROWWIDTH(state,row) ((state)->lineinfo[(row)].doublewidth ? ((state)->cols / 2) : (state)->cols)
+/* A double-width line holds half as many cells, but never fewer than one. */
+#define ROWWIDTH(state,row) ((state)->lineinfo[(row)].doublewidth ? ((state)->cols > 1 ? (state)->cols / 2 : 1) : (state)->cols)
 #define THISROWWIDTH(state) ROWWIDTH(state, (state)->pos.row)
 
   /* Mouse state */
@@ -172,6 +173,7 @@ struct VTermState
     void *user;
     char *buffer;
     size_t buflen;
+    bool buffer_owned; /* allocated by libvterm rather than supplied by the caller */
   } selection;
 };
 

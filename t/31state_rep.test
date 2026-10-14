@@ -126,3 +126,10 @@ PUSH "a\e[1000bb"
   putglyph 0x61 1 0,79
   putglyph 0x62 1 1,0
 
+
+!REP after a zero-width character repeats nothing (and must not hang)
+RESET
+PUSH "\xE2\x80\x8D\e[5b"
+  putglyph 0x200d 0 0,0
+PUSH "x"
+  putglyph 0x78 1 0,0
