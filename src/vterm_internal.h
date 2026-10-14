@@ -40,6 +40,8 @@ struct VTermPen
 {
   VTermColor fg;
   VTermColor bg;
+  VTermColor uline_color; /* DEFAULT_FG type: follow the foreground */
+  uint32_t link;          /* OSC 8 hyperlink id, 0 for none */
   unsigned int bold:1;
   unsigned int underline:2;
   unsigned int italic:1;
@@ -149,6 +151,21 @@ struct VTermState
       unsigned int cursor_shape:2;
     } mode;
   } saved;
+
+  /* OSC 8 hyperlinks. Link ids count up from 1; the entry for id N lives in
+   * slot (N-1) % LINK_TABLE_SIZE, so only the most recent LINK_TABLE_SIZE links
+   * can be looked up. The table is allocated when the first link arrives. */
+#define LINK_TABLE_SIZE 4096
+  struct VTermLink {
+    uint32_t id;    /* 0 for an empty slot */
+    uint32_t hash;
+    char *key;      /* the "id=" parameter, possibly empty */
+    char *uri;
+  } *links;
+  uint32_t link_next_id;
+  char *osc8_buf;   /* the OSC 8 string so far: "params;uri" */
+  size_t osc8_len;
+  bool osc8_overflow;
 
   /* Temporary state for DECRQSS parsing */
   union {

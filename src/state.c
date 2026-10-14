@@ -81,6 +81,13 @@ static VTermState *vterm_state_new(VTerm *vt)
   state->selection.buffer    = NULL;
   state->selection.buffer_owned = false;
 
+  state->links = NULL;
+  state->link_next_id = 1;
+  state->osc8_buf = NULL;
+  state->osc8_len = 0;
+  state->osc8_overflow = false;
+  state->pen.link = 0;
+
   vterm_state_newpen(state);
 
   state->bold_is_highbright = 0;
@@ -111,6 +118,14 @@ INTERNAL void vterm_state_free(VTermState *state)
   vterm_allocator_free(state->vt, state->combine_chars);
   if(state->selection.buffer_owned)
     vterm_allocator_free(state->vt, state->selection.buffer);
+  if(state->links) {
+    for(int i = 0; i < LINK_TABLE_SIZE; i++) {
+      vterm_allocator_free(state->vt, state->links[i].key);
+      vterm_allocator_free(state->vt, state->links[i].uri);
+    }
+    vterm_allocator_free(state->vt, state->links);
+  }
+  vterm_allocator_free(state->vt, state->osc8_buf);
   vterm_allocator_free(state->vt, state);
 }
 
@@ -1965,6 +1980,153 @@ static void osc_selection(VTermState *state, VTermStringFragment frag)
   }
 }
 
+/* ---- OSC 8 hyperlinks: ESC ] 8 ; params ; URI ST ---- */
+
+#define OSC8_MAX 4096 /* longer strings are ignored */
+
+static char *link_strdup(VTermState *state, const char *s, size_t len)
+{
+  char *copy = vterm_allocator_malloc(state->vt, len + 1);
+  if(!copy)
+    return NULL;
+  memcpy(copy, s, len);
+  copy[len] = 0;
+  return copy;
+}
+
+static uint32_t link_hash(const char *key, size_t keylen, const char *uri, size_t urilen)
+{
+  uint32_t h = 2166136261u; /* FNV-1a */
+  for(size_t i = 0; i < keylen; i++) h = (h ^ (unsigned char)key[i]) * 16777619u;
+  h = (h ^ 0x1f) * 16777619u;
+  for(size_t i = 0; i < urilen; i++) h = (h ^ (unsigned char)uri[i]) * 16777619u;
+  return h;
+}
+
+/* Returns the id of the link with this key and URI, adding it if needed; 0 on failure */
+static uint32_t link_intern(VTermState *state, const char *key, size_t keylen, const char *uri, size_t urilen)
+{
+  if(!state->links) {
+    state->links = vterm_allocator_malloc(state->vt, sizeof(state->links[0]) * LINK_TABLE_SIZE);
+    if(!state->links)
+      return 0;
+    memset(state->links, 0, sizeof(state->links[0]) * LINK_TABLE_SIZE);
+    state->link_next_id = 1;
+  }
+
+  uint32_t hash = link_hash(key, keylen, uri, urilen);
+
+  for(int i = 0; i < LINK_TABLE_SIZE; i++) {
+    const struct VTermLink *l = &state->links[i];
+    if(l->id && l->hash == hash && strlen(l->key) == keylen && strlen(l->uri) == urilen &&
+       memcmp(l->key, key, keylen) == 0 && memcmp(l->uri, uri, urilen) == 0)
+      return l->id;
+  }
+
+  uint32_t id = state->link_next_id++;
+  if(id == 0 || id > 0x7fffffff) { /* ids are handed out as ints; start over rather than wrap */
+    state->link_next_id = 2;
+    id = 1;
+  }
+
+  struct VTermLink *slot = &state->links[(id - 1) % LINK_TABLE_SIZE];
+  vterm_allocator_free(state->vt, slot->key);
+  vterm_allocator_free(state->vt, slot->uri);
+  slot->key = link_strdup(state, key, keylen);
+  slot->uri = link_strdup(state, uri, urilen);
+  if(!slot->key || !slot->uri) {
+    vterm_allocator_free(state->vt, slot->key);
+    vterm_allocator_free(state->vt, slot->uri);
+    slot->key = slot->uri = NULL;
+    slot->id = 0;
+    return 0;
+  }
+  slot->id = id;
+  slot->hash = hash;
+  return id;
+}
+
+static void set_link(VTermState *state, uint32_t id)
+{
+  state->pen.link = id;
+  VTermValue val = { .number = (int)id };
+  if(state->callbacks && state->callbacks->setpenattr)
+    (*state->callbacks->setpenattr)(VTERM_ATTR_LINK, &val, state->cbdata);
+}
+
+static void osc_hyperlink(VTermState *state, VTermStringFragment frag)
+{
+  if(frag.initial) {
+    state->osc8_len = 0;
+    state->osc8_overflow = false;
+  }
+
+  if(!state->osc8_overflow && frag.len) {
+    if(state->osc8_len + frag.len > OSC8_MAX) {
+      state->osc8_overflow = true;
+    }
+    else {
+      if(!state->osc8_buf)
+        state->osc8_buf = vterm_allocator_malloc(state->vt, OSC8_MAX);
+      if(!state->osc8_buf) {
+        state->osc8_overflow = true;
+      }
+      else {
+        memcpy(state->osc8_buf + state->osc8_len, frag.str, frag.len);
+        state->osc8_len += frag.len;
+      }
+    }
+  }
+
+  if(!frag.final)
+    return;
+
+  if(state->osc8_overflow || !state->osc8_buf)
+    return;
+
+  const char *buf = state->osc8_buf;
+  size_t len = state->osc8_len;
+  const char *semi = memchr(buf, ';', len);
+  if(!semi)
+    return; /* not "params;uri" */
+
+  const char *params = buf;
+  size_t paramslen = (size_t)(semi - buf);
+  const char *uri = semi + 1;
+  size_t urilen = len - paramslen - 1;
+
+  if(urilen == 0) {
+    set_link(state, 0); /* ESC ] 8 ; ; ST ends the link */
+    return;
+  }
+
+  /* params is a ':'-separated list of key=value; only "id" matters to us */
+  const char *key = "";
+  size_t keylen = 0;
+  for(size_t i = 0; i < paramslen; ) {
+    size_t end = i;
+    while(end < paramslen && params[end] != ':')
+      end++;
+    if(end - i > 3 && memcmp(params + i, "id=", 3) == 0) {
+      key = params + i + 3;
+      keylen = end - i - 3;
+      break;
+    }
+    i = end + 1;
+  }
+
+  set_link(state, link_intern(state, key, keylen, uri, urilen));
+}
+
+const char *vterm_state_get_hyperlink(const VTermState *state, uint32_t id)
+{
+  if(!state->links || id == 0)
+    return NULL;
+
+  const struct VTermLink *l = &state->links[(id - 1) % LINK_TABLE_SIZE];
+  return l->id == id ? l->uri : NULL;
+}
+
 static int on_osc(int command, VTermStringFragment frag, void *user)
 {
   VTermState *state = user;
@@ -1981,6 +2143,10 @@ static int on_osc(int command, VTermStringFragment frag, void *user)
 
     case 2:
       settermprop_string(state, VTERM_PROP_TITLE, frag);
+      return 1;
+
+    case 8:
+      osc_hyperlink(state, frag);
       return 1;
 
     case 52:
@@ -2306,6 +2472,7 @@ void vterm_state_reset(VTermState *state, int hard)
     (*state->callbacks->initpen)(state->cbdata);
 
   vterm_state_resetpen(state);
+  set_link(state, 0); /* unlike SGR 0, a full reset also ends any hyperlink */
 
   VTermEncoding *default_enc = state->vt->mode.utf8 ?
       vterm_lookup_encoding(ENC_UTF8,      'u') :

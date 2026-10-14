@@ -245,6 +245,8 @@ typedef enum {
   VTERM_ATTR_BACKGROUND, // color:  40-49 100-107
   VTERM_ATTR_SMALL,      // bool:   73, 74, 75
   VTERM_ATTR_BASELINE,   // number: 73, 74, 75
+  VTERM_ATTR_UNDERLINE_COLOR, // color:  58, 59 (DEFAULT_FG type means "same as the foreground")
+  VTERM_ATTR_LINK,       // number: OSC 8 hyperlink id, 0 for none
 
   VTERM_N_ATTRS
 } VTermAttr;
@@ -497,6 +499,16 @@ void vterm_state_set_selection_callbacks(VTermState *state, const VTermSelection
 
 void vterm_state_send_selection(VTermState *state, VTermSelectionMask mask, VTermStringFragment frag);
 
+/**
+ * The URI of an OSC 8 hyperlink, by the id found in VTermScreenCell.link or
+ * VTERM_ATTR_LINK, or NULL if the id is unknown or has been forgotten (only the
+ * most recent 4096 distinct links are kept). The string stays valid until the
+ * next input is written.
+ */
+const char *vterm_state_get_hyperlink(const VTermState *state, uint32_t id);
+#define VTERM_HAS_HYPERLINKS 1
+#define VTERM_HAS_UNDERLINE_COLOR 1
+
 // ------------
 // Screen layer
 // ------------
@@ -534,6 +546,8 @@ typedef struct {
   char     width;
   VTermScreenCellAttrs attrs;
   VTermColor fg, bg;
+  VTermColor uline;  /* underline colour; a DEFAULT_FG colour means "same as fg" */
+  uint32_t   link;   /* OSC 8 hyperlink id, 0 for none; see vterm_screen_get_hyperlink() */
 } VTermScreenCell;
 
 typedef struct {
@@ -568,6 +582,9 @@ void vterm_screen_enable_reflow(VTermScreen *screen, bool reflow);
  * shortened width. Off by default, in which case `cols` is always the full width.
  */
 void vterm_screen_set_sb_trim(VTermScreen *screen, bool trim);
+
+/** See vterm_state_get_hyperlink() */
+const char *vterm_screen_get_hyperlink(const VTermScreen *screen, uint32_t id);
 #define VTERM_HAS_SB_TRIM 1
 
 // Back-compat alias for the brief time it was in 0.3-RC1

@@ -182,6 +182,10 @@ INTERNAL void vterm_state_resetpen(VTermState *state)
 
   state->pen.fg = state->default_fg;  setpenattr_col(state, VTERM_ATTR_FOREGROUND, state->default_fg);
   state->pen.bg = state->default_bg;  setpenattr_col(state, VTERM_ATTR_BACKGROUND, state->default_bg);
+
+  /* "Same as the foreground". SGR 0 deliberately leaves the OSC 8 hyperlink alone. */
+  state->pen.uline_color = state->default_fg;
+  setpenattr_col(state, VTERM_ATTR_UNDERLINE_COLOR, state->pen.uline_color);
 }
 
 INTERNAL void vterm_state_savepen(VTermState *state, int save)
@@ -205,6 +209,8 @@ INTERNAL void vterm_state_savepen(VTermState *state, int save)
 
     setpenattr_col( state, VTERM_ATTR_FOREGROUND, state->pen.fg);
     setpenattr_col( state, VTERM_ATTR_BACKGROUND, state->pen.bg);
+    setpenattr_col( state, VTERM_ATTR_UNDERLINE_COLOR, state->pen.uline_color);
+    setpenattr_int( state, VTERM_ATTR_LINK, (int)state->pen.link);
   }
 }
 
@@ -432,6 +438,41 @@ INTERNAL void vterm_state_setpen(VTermState *state, const long args[], int argco
       setpenattr_col(state, VTERM_ATTR_BACKGROUND, state->pen.bg);
       break;
 
+    case 58: { // Underline colour
+      /* Either the semicolon form (58;2;r;g;b or 58;5;n) or the colon form,
+       * 58:2::r:g:b / 58:2:r:g:b / 58:5:n, which is what neovim and kitty send */
+      int group = 1;
+      while(argi + group - 1 < argcount && CSI_ARG_HAS_MORE(args[argi + group - 1]))
+        group++;
+
+      if(group > 1) {
+        int palette = group > 1 ? (int)CSI_ARG(args[argi + 1]) : 0;
+        const long *p = args + argi + 2;
+        int n = group - 2;
+        if(palette == 2) {
+          if(n >= 4) { p++; n--; } /* skip the colour-space id */
+          if(n >= 3)
+            vterm_color_rgb(&state->pen.uline_color, CSI_ARG(p[0]), CSI_ARG(p[1]), CSI_ARG(p[2]));
+        }
+        else if(palette == 5 && n >= 1) {
+          vterm_color_indexed(&state->pen.uline_color, CSI_ARG(p[0]));
+        }
+        /* the end-of-loop skip consumes the rest of the colon group */
+      }
+      else {
+        if(argcount - argi < 2)
+          return;
+        argi += 1 + lookup_colour(state, CSI_ARG(args[argi+1]), args+argi+2, argcount-argi-2, &state->pen.uline_color);
+      }
+      setpenattr_col(state, VTERM_ATTR_UNDERLINE_COLOR, state->pen.uline_color);
+      break;
+    }
+
+    case 59: // Underline colour default
+      state->pen.uline_color = state->default_fg;
+      setpenattr_col(state, VTERM_ATTR_UNDERLINE_COLOR, state->pen.uline_color);
+      break;
+
     case 73: // Superscript
     case 74: // Subscript
     case 75: // Superscript/subscript off
@@ -597,6 +638,14 @@ int vterm_state_get_penattr(const VTermState *state, VTermAttr attr, VTermValue 
 
   case VTERM_ATTR_BASELINE:
     val->number = state->pen.baseline;
+    return 1;
+
+  case VTERM_ATTR_UNDERLINE_COLOR:
+    val->color = state->pen.uline_color;
+    return 1;
+
+  case VTERM_ATTR_LINK:
+    val->number = (int)state->pen.link;
     return 1;
 
   case VTERM_N_ATTRS:

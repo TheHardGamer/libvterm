@@ -436,6 +436,8 @@ static struct {
   int baseline;
   VTermColor foreground;
   VTermColor background;
+  VTermColor underline_color;
+  int link;
 } state_pen;
 static int state_setpenattr(VTermAttr attr, VTermValue *val, void *user)
 {
@@ -475,6 +477,12 @@ static int state_setpenattr(VTermAttr attr, VTermValue *val, void *user)
     break;
   case VTERM_ATTR_BACKGROUND:
     state_pen.background = val->color;
+    break;
+  case VTERM_ATTR_UNDERLINE_COLOR:
+    state_pen.underline_color = val->color;
+    break;
+  case VTERM_ATTR_LINK:
+    state_pen.link = val->number;
     break;
 
   case VTERM_N_ATTRS:
@@ -1063,6 +1071,23 @@ int main(int argc, char **argv)
           print_color(&state_pen.background);
           printf("\n");
         }
+        else if(streq(linep, "underline_color")) {
+          vterm_state_get_penattr(state, VTERM_ATTR_UNDERLINE_COLOR, &val);
+          if(!vterm_color_is_equal(&val.color, &state_pen.underline_color))
+            printf("! pen underline_color mismatch between state and event\n");
+          else {
+            print_color(&state_pen.underline_color);
+            printf("\n");
+          }
+        }
+        else if(streq(linep, "link")) {
+          const char *uri = vterm_state_get_hyperlink(state, state_pen.link);
+          vterm_state_get_penattr(state, VTERM_ATTR_LINK, &val);
+          if(val.number != state_pen.link)
+            printf("! pen link mismatch: state=%d, event=%d\n", val.number, state_pen.link);
+          else
+            printf("%s\n", uri ? uri : "none");
+        }
         else
           printf("?\n");
       }
@@ -1193,6 +1218,25 @@ int main(int argc, char **argv)
         vterm_screen_convert_color_to_rgb(screen, &cell.bg);
         print_color(&cell.bg);
         printf("\n");
+      }
+      else if(strstartswith(line, "?screen_extra ")) {
+        /* the parts of a cell that ?screen_cell doesn't show: underline colour and hyperlink */
+        assert(screen);
+        char *linep = line + 13;
+        VTermPos pos;
+        while(linep[0] == ' ')
+          linep++;
+        if(sscanf(linep, "%d,%d\n", &pos.row, &pos.col) < 2) {
+          printf("! screen_extra unrecognised input\n");
+          goto abort_line;
+        }
+        VTermScreenCell cell;
+        if(!vterm_screen_get_cell(screen, pos, &cell))
+          goto abort_line;
+        const char *uri = vterm_screen_get_hyperlink(screen, cell.link);
+        printf("uline=");
+        print_color(&cell.uline);
+        printf(" link=%s\n", uri ? uri : "none");
       }
       else if(strstartswith(line, "?screen_eol ")) {
         assert(screen);

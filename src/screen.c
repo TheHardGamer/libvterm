@@ -16,6 +16,8 @@ typedef struct
 {
   /* After the bitfield */
   VTermColor   fg, bg;
+  VTermColor   uline_color;
+  uint32_t     link;
 
   unsigned int bold      : 1;
   unsigned int underline : 2;
@@ -602,6 +604,12 @@ static int setpenattr(VTermAttr attr, VTermValue *val, void *user)
   case VTERM_ATTR_BASELINE:
     screen->pen.baseline = val->number;
     return 1;
+  case VTERM_ATTR_UNDERLINE_COLOR:
+    screen->pen.uline_color = val->color;
+    return 1;
+  case VTERM_ATTR_LINK:
+    screen->pen.link = (uint32_t)val->number;
+    return 1;
 
   case VTERM_N_ATTRS:
     return 0;
@@ -886,6 +894,8 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
 
         dst->pen.fg = src->fg;
         dst->pen.bg = src->bg;
+        dst->pen.uline_color = src->uline;
+        dst->pen.link        = src->link;
 
         if(src->width == 2 && pos.col < (new_cols-1)) {
           memset((dst + 1)->chars, 0, sizeof((dst + 1)->chars));
@@ -1192,6 +1202,8 @@ static inline void set_public_attrs(VTermScreenCell *cell, const ScreenPen *pen,
 
   cell->fg = pen->fg;
   cell->bg = pen->bg;
+  cell->uline = pen->uline_color;
+  cell->link  = pen->link;
 }
 
 /* Copy internal to external representation of a screen cell */
@@ -1243,10 +1255,14 @@ int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *ce
       cached.attrs = cell->attrs;
       cached.fg = cell->fg;
       cached.bg = cell->bg;
+      cached.uline = cell->uline;
+      cached.link = cell->link;
     } else {
       cell->attrs = cached.attrs;
       cell->fg = cached.fg;
       cell->bg = cached.bg;
+      cell->uline = cached.uline;
+      cell->link = cached.link;
     }
 
     if(col < (screen->cols - 1) &&
@@ -1280,6 +1296,11 @@ VTermScreen *vterm_obtain_screen(VTerm *vt)
   vt->screen = screen;
 
   return screen;
+}
+
+const char *vterm_screen_get_hyperlink(const VTermScreen *screen, uint32_t id)
+{
+  return vterm_state_get_hyperlink(screen->state, id);
 }
 
 void vterm_screen_set_sb_trim(VTermScreen *screen, bool trim)

@@ -1,0 +1,49 @@
+INIT
+UTF8 1
+WANTSCREEN
+
+!Underline colour is stored per cell
+RESET
+PUSH "\e[4;58;2;9;8;7mA\e[0mB"
+  ?screen_extra 0,0 = uline=rgb(9,8,7) link=none
+  ?screen_extra 0,1 = uline=rgb(240,240,240,is_default_fg) link=none
+
+!Hyperlink on and off, with ST
+RESET
+PUSH "\e]8;;http://example.com/a\e\\"
+PUSH "ab"
+PUSH "\e]8;;\e\\"
+PUSH "c"
+  ?screen_extra 0,0 = uline=rgb(240,240,240,is_default_fg) link=http://example.com/a
+  ?screen_extra 0,1 = uline=rgb(240,240,240,is_default_fg) link=http://example.com/a
+  ?screen_extra 0,2 = uline=rgb(240,240,240,is_default_fg) link=none
+
+!Links with the same id and URI are the same link; a different URI is another
+RESET
+PUSH "\e]8;id=1;http://same.example/\e\\x\e]8;;\e\\"
+PUSH "\e]8;id=1;http://same.example/\e\\y\e]8;;\e\\"
+PUSH "\e]8;id=1;http://other.example/\e\\z\e]8;;\e\\"
+  ?screen_extra 0,0 = uline=rgb(240,240,240,is_default_fg) link=http://same.example/
+  ?screen_extra 0,1 = uline=rgb(240,240,240,is_default_fg) link=http://same.example/
+  ?screen_extra 0,2 = uline=rgb(240,240,240,is_default_fg) link=http://other.example/
+
+!An oversized hyperlink is ignored
+RESET
+PUSH "\e]8;;http://big.example/"
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "x"x400
+PUSH "\e\\"
+PUSH "ok"
+  ?screen_extra 0,0 = uline=rgb(240,240,240,is_default_fg) link=none
+
