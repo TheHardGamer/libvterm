@@ -393,3 +393,10 @@ INTERNAL int vterm_unicode_is_plain(uint32_t codepoint)
 {
   return unicode_info(codepoint) == 2; /* width + 1 == 2, combining bit clear */
 }
+
+/* 1 or 2 for a non-combining character of that width, else 0 */
+INTERNAL int vterm_unicode_plain_width(uint32_t codepoint)
+{
+  int info = unicode_info(codepoint);
+  return (info == 2 || info == 3) ? info - 1 : 0;
+}

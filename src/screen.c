@@ -11,37 +11,7 @@
 
 #undef DEBUG_REFLOW
 
-/* State of the pen at some moment in time, also used in a cell */
-typedef struct
-{
-  /* After the bitfield */
-  VTermColor   fg, bg;
-  VTermColor   uline_color;
-  uint32_t     link;
-
-  unsigned int bold      : 1;
-  unsigned int underline : 2;
-  unsigned int italic    : 1;
-  unsigned int blink     : 1;
-  unsigned int reverse   : 1;
-  unsigned int conceal   : 1;
-  unsigned int strike    : 1;
-  unsigned int font      : 4; /* 0 to 9 */
-  unsigned int small     : 1;
-  unsigned int baseline  : 2;
-
-  /* Extra state storage that isn't strictly pen-related */
-  unsigned int protected_cell : 1;
-  unsigned int dwl            : 1; /* on a DECDWL or DECDHL line */
-  unsigned int dhl            : 2; /* on a DECDHL line (1=top 2=bottom) */
-} ScreenPen;
-
-/* Internal representation of a screen cell */
-typedef struct
-{
-  uint32_t chars[VTERM_MAX_CHARS_PER_CELL];
-  ScreenPen pen;
-} ScreenCell;
+#include "scrollback.h"
 
 struct VTermScreen
 {
@@ -81,16 +51,168 @@ struct VTermScreen
   /* buffer for a single screen row used in scrollback storage callbacks */
   VTermScreenCell *sb_buffer;
 
+  /* scrolled-off rows, when the library keeps them (see vterm_screen_enable_scrollback) */
+  VTermScrollback sb;
+
   ScreenPen pen;
   bool mode_synchronized; /* track current sync state */
+
+  /* Interned pens. `pens[id]` is unique among the entries; `pen_hash` is an
+   * open-addressing table of id+1 (0 = empty). */
+  ScreenPen *pens;
+  uint32_t npens, pens_cap;
+  uint32_t *pen_hash;
+  uint32_t pen_hash_cap; /* power of two, at least twice pens_cap */
+  uint32_t pen_id;       /* id of `pen`; valid unless pen_dirty */
+  bool pen_dirty;
+  uint32_t last_pen_id;  /* the id the last lookup found, tried first next time */
+  int pen_gc_lock;       /* > 0 while cells exist that the collector cannot see */
 };
+
+_Static_assert(sizeof(ScreenPen) % sizeof(uint32_t) == 0, "pens are hashed a word at a time");
+
+static inline uint32_t pen_hash_of(const ScreenPen *pen)
+{
+  uint32_t words[sizeof(ScreenPen) / sizeof(uint32_t)];
+  memcpy(words, pen, sizeof(words));
+  uint32_t h = 2166136261u;
+  for(size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+    h ^= words[i];
+    h *= 16777619u;
+    h ^= h >> 15;
+  }
+  return h;
+}
+
+static void pens_rehash(VTermScreen *screen)
+{
+  memset(screen->pen_hash, 0, sizeof(uint32_t) * screen->pen_hash_cap);
+  uint32_t mask = screen->pen_hash_cap - 1;
+  for(uint32_t id = 0; id < screen->npens; id++) {
+    uint32_t slot = pen_hash_of(&screen->pens[id]) & mask;
+    while(screen->pen_hash[slot])
+      slot = (slot + 1) & mask;
+    screen->pen_hash[slot] = id + 1;
+  }
+}
+
+static void pens_resize_tables(VTermScreen *screen, uint32_t cap)
+{
+  ScreenPen *pens = vterm_allocator_malloc(screen->vt, sizeof(ScreenPen) * cap);
+  if(screen->pens) {
+    memcpy(pens, screen->pens, sizeof(ScreenPen) * screen->npens);
+    vterm_allocator_free(screen->vt, screen->pens);
+  }
+  screen->pens = pens;
+  screen->pens_cap = cap;
+
+  vterm_allocator_free(screen->vt, screen->pen_hash);
+  screen->pen_hash_cap = cap * 2;
+  screen->pen_hash = vterm_allocator_malloc(screen->vt, sizeof(uint32_t) * screen->pen_hash_cap);
+  pens_rehash(screen);
+}
+
+/* Drops the pens no cell uses, renumbering the survivors (cells are rewritten) */
+static void pens_collect(VTermScreen *screen)
+{
+  uint32_t n = screen->npens;
+  uint32_t *map = vterm_allocator_malloc(screen->vt, sizeof(uint32_t) * n);
+  memset(map, 0xFF, sizeof(uint32_t) * n);
+
+  for(int b = 0; b < 2; b++) {
+    if(!screen->buffers[b])
+      continue;
+    size_t count = (size_t)screen->rows * screen->cols;
+    for(size_t i = 0; i < count; i++) {
+      uint32_t id = screen->buffers[b][i].pen;
+      if(id < n)
+        map[id] = 0;
+    }
+  }
+  if(!screen->pen_dirty && screen->pen_id < n)
+    map[screen->pen_id] = 0;
+
+  uint32_t kept = 0;
+  for(uint32_t id = 0; id < n; id++)
+    if(map[id] == 0) {
+      map[id] = kept;
+      screen->pens[kept++] = screen->pens[id];
+    }
+  screen->npens = kept;
+
+  for(int b = 0; b < 2; b++) {
+    if(!screen->buffers[b])
+      continue;
+    size_t count = (size_t)screen->rows * screen->cols;
+    for(size_t i = 0; i < count; i++) {
+      uint32_t id = screen->buffers[b][i].pen;
+      if(id < n)
+        screen->buffers[b][i].pen = map[id];
+    }
+  }
+  if(!screen->pen_dirty && screen->pen_id < n)
+    screen->pen_id = map[screen->pen_id];
+  screen->last_pen_id = 0;
+
+  vterm_allocator_free(screen->vt, map);
+  pens_rehash(screen);
+}
+
+/* Returns the id of `pen`, adding it to the table if it is new. May renumber
+ * the pens (and every cell), so ids from before the call must not be reused. */
+static uint32_t intern_pen(VTermScreen *screen, const ScreenPen *pen)
+{
+  if(screen->last_pen_id < screen->npens &&
+     memcmp(&screen->pens[screen->last_pen_id], pen, sizeof(ScreenPen)) == 0)
+    return screen->last_pen_id;
+
+  ScreenPen key = *pen; /* `pen` may point into the table */
+  uint32_t mask = screen->pen_hash_cap - 1;
+  uint32_t slot = pen_hash_of(&key) & mask;
+  while(screen->pen_hash[slot]) {
+    uint32_t id = screen->pen_hash[slot] - 1;
+    if(memcmp(&screen->pens[id], &key, sizeof(ScreenPen)) == 0) {
+      screen->last_pen_id = id;
+      return id;
+    }
+    slot = (slot + 1) & mask;
+  }
+
+  if(screen->npens == screen->pens_cap) {
+    if(!screen->pen_gc_lock)
+      pens_collect(screen);
+    if(screen->npens >= screen->pens_cap / 2)
+      pens_resize_tables(screen, screen->pens_cap * 2);
+    return intern_pen(screen, &key);
+  }
+
+  uint32_t id = screen->npens++;
+  screen->pens[id] = key;
+  screen->pen_hash[slot] = id + 1;
+  screen->last_pen_id = id;
+  return id;
+}
+
+static inline uint32_t current_pen(VTermScreen *screen)
+{
+  if(screen->pen_dirty) {
+    screen->pen_id = intern_pen(screen, &screen->pen);
+    screen->pen_dirty = false;
+  }
+  return screen->pen_id;
+}
+
+static inline const ScreenPen *cell_pen(const VTermScreen *screen, const ScreenCell *cell)
+{
+  return &screen->pens[cell->pen];
+}
 
 /* Invariant: every entry of ScreenCell.chars after the first 0 is also 0, so
  * a whole cell can be copied without looking for the terminator. */
-static inline void clearcell(const VTermScreen *screen, ScreenCell *cell)
+static inline void clearcell(VTermScreen *screen, ScreenCell *cell)
 {
   memset(cell->chars, 0, sizeof(cell->chars));
-  cell->pen = screen->pen;
+  cell->pen = current_pen(screen);
 }
 
 static inline ScreenCell *getcell(const VTermScreen *screen, int row, int col)
@@ -106,11 +228,11 @@ static void alloc_buffer(VTermScreen *screen, int bufidx, int rows, int cols)
 {
   ScreenCell *new_buffer = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * rows * cols);
 
-  for(int row = 0; row < rows; row++) {
-    for(int col = 0; col < cols; col++) {
-      clearcell(screen, &new_buffer[row * cols + col]);
-    }
-  }
+  ScreenCell blank;
+  memset(blank.chars, 0, sizeof(blank.chars));
+  blank.pen = current_pen(screen);
+  for(int i = 0; i < rows * cols; i++)
+    new_buffer[i] = blank;
 
   screen->buffers[bufidx] = new_buffer;
 
@@ -201,11 +323,15 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
   if(!cell)
     return 0;
 
+  ScreenPen pen;
+  if(info->chars[0])
+    pen = screen->pen;
+  else
+    pen = *cell_pen(screen, cell);
+
   int i;
-  for(i = 0; i < VTERM_MAX_CHARS_PER_CELL && info->chars[i]; i++) {
+  for(i = 0; i < VTERM_MAX_CHARS_PER_CELL && info->chars[i]; i++)
     cell->chars[i] = info->chars[i];
-    cell->pen = screen->pen;
-  }
   for( ; i < VTERM_MAX_CHARS_PER_CELL; i++)
     cell->chars[i] = 0;
 
@@ -229,9 +355,10 @@ static int putglyph(VTermGlyphInfo *info, VTermPos pos, void *user)
     .end_col   = pos.col+width,
   };
 
-  cell->pen.protected_cell = info->protected_cell;
-  cell->pen.dwl            = info->dwl;
-  cell->pen.dhl            = info->dhl;
+  pen.protected_cell = info->protected_cell;
+  pen.dwl            = info->dwl;
+  pen.dhl            = info->dhl;
+  cell->pen = intern_pen(screen, &pen);
 
   damagerect(screen, rect);
 
@@ -257,13 +384,16 @@ INTERNAL int vterm_screen_putglyphs(VTermScreen *screen, VTermPos pos, const uin
   pen.protected_cell = info->protected_cell;
   pen.dwl            = info->dwl;
   pen.dhl            = info->dhl;
+  /* putglyphs is given the pen on every call; screen->pen may be unchanged so
+   * intern_pen's one-entry cache mostly answers this */
 
+  const uint32_t pen_id = intern_pen(screen, &pen);
   for(int i = 0; i < count; i++) {
     ScreenCell *cell = rowstart + i;
     cell->chars[0] = chars[i];
     for(int j = 1; j < VTERM_MAX_CHARS_PER_CELL; j++)
       cell->chars[j] = 0;
-    cell->pen = pen;
+    cell->pen = pen_id;
   }
 
   VTermRect rect = {
@@ -279,24 +409,41 @@ INTERNAL int vterm_screen_putglyphs(VTermScreen *screen, VTermPos pos, const uin
 
 /* A trailing cell that shows nothing: no character, default background, and no
  * attribute that draws on an empty cell. */
-static inline bool cell_is_blank_tail(const ScreenCell *cell)
+static inline bool cell_is_blank_tail(const VTermScreen *screen, const ScreenCell *cell)
 {
+  const ScreenPen *pen = cell_pen(screen, cell);
   return cell->chars[0] == 0 &&
-         VTERM_COLOR_IS_DEFAULT_BG(&cell->pen.bg) &&
-         !cell->pen.reverse && !cell->pen.underline && !cell->pen.strike;
+         VTERM_COLOR_IS_DEFAULT_BG(&pen->bg) &&
+         !pen->reverse && !pen->underline && !pen->strike;
 }
 
-static void sb_pushline_from_row(VTermScreen *screen, int row, bool continuation)
+static void convert_row(const VTermScreen *screen, const ScreenCell *rowstart, VTermScreenCell *cells, int limit);
+
+static inline bool sb_wanted(const VTermScreen *screen)
+{
+  return screen->sb.max_lines ||
+    (screen->callbacks && screen->callbacks->sb_pushline) ||
+    (screen->callbacks_has_pushline4 && screen->callbacks && screen->callbacks->sb_pushline4);
+}
+
+/* `rowstart` is the first cell of a row of the primary screen. It is passed in,
+ * not looked up, because a resize pushes rows of the primary screen while the
+ * alternate one may be the active one. */
+static void sb_pushline_from_row(VTermScreen *screen, const ScreenCell *rowstart, bool continuation)
 {
   int cols = screen->cols;
 
+  if(screen->sb.max_lines) {
+    vterm_scrollback_push(&screen->sb, rowstart, cols, screen->pens, !screen->global_reverse, continuation);
+    return;
+  }
+
   if(screen->sb_trim && !screen->global_reverse) {
-    const ScreenCell *rowstart = screen->row_ptrs_active[row];
-    while(cols > 0 && cell_is_blank_tail(rowstart + cols - 1))
+    while(cols > 0 && cell_is_blank_tail(screen, rowstart + cols - 1))
       cols--;
   }
 
-  vterm_screen_get_row(screen, row, screen->sb_buffer, cols);
+  convert_row(screen, rowstart, screen->sb_buffer, cols);
 
   if(screen->callbacks_has_pushline4 && screen->callbacks->sb_pushline4)
     (screen->callbacks->sb_pushline4)(cols, screen->sb_buffer, continuation, screen->cbdata);
@@ -308,14 +455,13 @@ static int premove(VTermRect rect, void *user)
 {
   VTermScreen *screen = user;
 
-  if(((screen->callbacks && screen->callbacks->sb_pushline) ||
-        (screen->callbacks_has_pushline4 && screen->callbacks && screen->callbacks->sb_pushline4)) &&
+  if(sb_wanted(screen) &&
      rect.start_row == 0 && rect.start_col == 0 &&        // starts top-left corner
      rect.end_col == screen->cols &&                      // full width
      screen->buffer == screen->buffers[BUFIDX_PRIMARY]) { // not altscreen
     for(int row = 0; row < rect.end_row; row++) {
       const VTermLineInfo *lineinfo = vterm_state_get_lineinfo(screen->state, row);
-      sb_pushline_from_row(screen, row, lineinfo->continuation);
+      sb_pushline_from_row(screen, screen->row_ptrs_active[row], lineinfo->continuation);
     }
   }
 
@@ -351,6 +497,10 @@ static int moverect_internal(VTermRect dest, VTermRect src, void *user)
 
   int cols = src.end_col - src.start_col;
   int downward = src.start_row - dest.start_row;
+
+  /* an empty rectangle may sit outside the screen, where there are no cells to point at */
+  if(cols <= 0)
+    return 1;
 
   /* Full-width vertical scroll: just rotate row pointers, then let erase_internal
    * clear the exposed rows. This avoids memmove()-ing every cell. */
@@ -426,15 +576,26 @@ static int erase_internal(VTermRect rect, int selective, void *user)
 
   ScreenCell blank;
   memset(&blank, 0, sizeof(blank));
+
   /* Only copy .fg and .bg; leave things like rv in reset state */
-  blank.pen.fg = screen->pen.fg;
-  blank.pen.bg = screen->pen.bg;
+  ScreenPen blank_pen;
+  memset(&blank_pen, 0, sizeof(blank_pen));
+  blank_pen.fg = screen->pen.fg;
+  blank_pen.bg = screen->pen.bg;
+  blank_pen.uline_color = screen->pen.uline_color; /* so that a blank cell is a default cell when nothing else is set */
+  const uint32_t plain_id = intern_pen(screen, &blank_pen);
+  screen->pen_gc_lock++; /* ids interned below are held across the loop */
 
   for(int row = rect.start_row; row < screen->state->rows && row < rect.end_row; row++) {
     const VTermLineInfo *info = vterm_state_get_lineinfo(screen->state, row);
 
-    blank.pen.dwl = info->doublewidth;
-    blank.pen.dhl = info->doubleheight;
+    if(info->doublewidth || info->doubleheight) {
+      blank_pen.dwl = info->doublewidth;
+      blank_pen.dhl = info->doubleheight;
+      blank.pen = intern_pen(screen, &blank_pen);
+    }
+    else
+      blank.pen = plain_id;
 
     if(!selective) {
       fill_cells(getcell(screen, row, rect.start_col), rect.end_col - rect.start_col, &blank);
@@ -444,13 +605,14 @@ static int erase_internal(VTermRect rect, int selective, void *user)
     for(int col = rect.start_col; col < rect.end_col; col++) {
       ScreenCell *cell = getcell(screen, row, col);
 
-      if(cell->pen.protected_cell)
+      if(cell_pen(screen, cell)->protected_cell)
         continue;
 
       *cell = blank;
     }
   }
 
+  screen->pen_gc_lock--;
   return 1;
 }
 
@@ -566,6 +728,8 @@ static int movecursor(VTermPos pos, VTermPos oldpos, int visible, void *user)
 static int setpenattr(VTermAttr attr, VTermValue *val, void *user)
 {
   VTermScreen *screen = user;
+
+  screen->pen_dirty = true;
 
   switch(attr) {
   case VTERM_ATTR_BOLD:
@@ -721,6 +885,9 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
     /* TODO: Stop if dwl or dhl */
     while(screen->reflow && old_lineinfo && old_row >= 0 && old_lineinfo[old_row].continuation)
       old_row--;
+    /* The top row may itself continue a line that already scrolled off: the group starts there */
+    if(old_row < 0)
+      old_row = 0;
     int old_row_start = old_row;
 
     int width = 0;
@@ -846,26 +1013,40 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
 
   /* We really expect the cursor position to be set by now */
   if(active && (new_cursor.row == -1 || new_cursor.col == -1)) {
-    fprintf(stderr, "screen_resize failed to update cursor position\n");
-    abort();
+    /* The reflow lost track of the cursor (its row was folded away, for
+     * instance): keep it on screen at the nearest cell. */
+    new_cursor.row = old_cursor.row < new_rows ? old_cursor.row : new_rows - 1;
+    new_cursor.col = old_cursor.col < new_cols ? old_cursor.col : new_cols - 1;
+    if(new_cursor.row < 0) new_cursor.row = 0;
+    if(new_cursor.col < 0) new_cursor.col = 0;
   }
 
   if(old_row >= 0 && bufidx == BUFIDX_PRIMARY) {
     /* Push spare lines to scrollback buffer */
-    if((screen->callbacks && screen->callbacks->sb_pushline) ||
-          (screen->callbacks_has_pushline4 && screen->callbacks && screen->callbacks->sb_pushline4))
+    if(sb_wanted(screen))
       for(int row = 0; row <= old_row; row++) {
         const VTermLineInfo *lineinfo = old_lineinfo + row;
-        sb_pushline_from_row(screen, row, lineinfo->continuation);
+        sb_pushline_from_row(screen, old_buffer + (size_t)row * old_cols, lineinfo->continuation);
       }
     if(active)
       statefields->pos.row -= (old_row + 1);
   }
   if(new_row >= 0 && bufidx == BUFIDX_PRIMARY &&
-      screen->callbacks && screen->callbacks->sb_popline) {
+      (screen->sb.max_lines || (screen->callbacks && screen->callbacks->sb_popline))) {
     /* Try to backfill rows by popping scrollback buffer */
     while(new_row >= 0) {
-      if(!(screen->callbacks->sb_popline(old_cols, screen->sb_buffer, screen->cbdata)))
+      if(screen->sb.max_lines) {
+        int n = vterm_scrollback_pop(&screen->sb, screen->sb_buffer, old_cols, screen->global_reverse, NULL);
+        if(n < 0)
+          break;
+        if(n < old_cols) {
+          VTermScreenCell blank;
+          vterm_scrollback_blank_cell(&screen->sb, &blank, screen->global_reverse);
+          for(int c = n; c < old_cols; c++)
+            screen->sb_buffer[c] = blank;
+        }
+      }
+      else if(!(screen->callbacks->sb_popline(old_cols, screen->sb_buffer, screen->cbdata)))
         break;
 
       VTermPos pos = { .row = new_row };
@@ -881,21 +1062,24 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
             dst->chars[i] = 0;
         }
 
-        dst->pen.bold      = src->attrs.bold;
-        dst->pen.underline = src->attrs.underline;
-        dst->pen.italic    = src->attrs.italic;
-        dst->pen.blink     = src->attrs.blink;
-        dst->pen.reverse   = src->attrs.reverse ^ screen->global_reverse;
-        dst->pen.conceal   = src->attrs.conceal;
-        dst->pen.strike    = src->attrs.strike;
-        dst->pen.font      = src->attrs.font;
-        dst->pen.small     = src->attrs.small;
-        dst->pen.baseline  = src->attrs.baseline;
+        ScreenPen pen;
+        memset(&pen, 0, sizeof(pen));
+        pen.bold      = src->attrs.bold;
+        pen.underline = src->attrs.underline;
+        pen.italic    = src->attrs.italic;
+        pen.blink     = src->attrs.blink;
+        pen.reverse   = src->attrs.reverse ^ screen->global_reverse;
+        pen.conceal   = src->attrs.conceal;
+        pen.strike    = src->attrs.strike;
+        pen.font      = src->attrs.font;
+        pen.small     = src->attrs.small;
+        pen.baseline  = src->attrs.baseline;
 
-        dst->pen.fg = src->fg;
-        dst->pen.bg = src->bg;
-        dst->pen.uline_color = src->uline;
-        dst->pen.link        = src->link;
+        pen.fg = src->fg;
+        pen.bg = src->bg;
+        pen.uline_color = src->uline;
+        pen.link        = src->link;
+        dst->pen = intern_pen(screen, &pen);
 
         if(src->width == 2 && pos.col < (new_cols-1)) {
           memset((dst + 1)->chars, 0, sizeof((dst + 1)->chars));
@@ -966,10 +1150,13 @@ static int resize(int new_rows, int new_cols, VTermStateFields *fields, void *us
     screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * new_cols);
   }
 
+  screen->pen_gc_lock++; /* the new buffers are not installed yet, the collector would not see their cells */
   resize_buffer(screen, 0, new_rows, new_cols, !altscreen_active, fields);
   if(screen->buffers[BUFIDX_ALTSCREEN])
     resize_buffer(screen, 1, new_rows, new_cols, altscreen_active, fields);
-  else if(new_rows != old_rows) {
+  screen->pen_gc_lock--;
+  if(!screen->buffers[BUFIDX_ALTSCREEN])
+  if(new_rows != old_rows) {
     /* We don't need a full resize of the altscreen because it isn't enabled
      * but we should at least keep the lineinfo the right size */
     vterm_allocator_free(screen->vt, fields->lineinfos[BUFIDX_ALTSCREEN]);
@@ -1009,11 +1196,20 @@ static int setlineinfo(int row, const VTermLineInfo *newinfo, const VTermLineInf
 
   if(newinfo->doublewidth != oldinfo->doublewidth ||
      newinfo->doubleheight != oldinfo->doubleheight) {
+    screen->pen_gc_lock++;
+    uint32_t from = (uint32_t)-1, to = 0;
     for(int col = 0; col < screen->cols; col++) {
       ScreenCell *cell = getcell(screen, row, col);
-      cell->pen.dwl = newinfo->doublewidth;
-      cell->pen.dhl = newinfo->doubleheight;
+      if(cell->pen != from) {
+        ScreenPen pen = *cell_pen(screen, cell);
+        pen.dwl = newinfo->doublewidth;
+        pen.dhl = newinfo->doubleheight;
+        from = cell->pen;
+        to = intern_pen(screen, &pen);
+      }
+      cell->pen = to;
     }
+    screen->pen_gc_lock--;
 
     VTermRect rect = {
       .start_row = row,
@@ -1036,6 +1232,8 @@ static int setlineinfo(int row, const VTermLineInfo *newinfo, const VTermLineInf
 
 static int sb_clear(void *user) {
   VTermScreen *screen = user;
+
+  vterm_scrollback_clear(&screen->sb);
 
   if(screen->callbacks && screen->callbacks->sb_clear)
     if((*screen->callbacks->sb_clear)(screen->cbdata))
@@ -1065,6 +1263,7 @@ static VTermScreen *screen_new(VTerm *vt)
     return NULL;
 
   VTermScreen *screen = vterm_allocator_malloc(vt, sizeof(VTermScreen));
+  memset(screen, 0, sizeof(*screen));
   int rows, cols;
 
   vterm_get_size(vt, &rows, &cols);
@@ -1082,6 +1281,9 @@ static VTermScreen *screen_new(VTerm *vt)
   screen->global_reverse = false;
   screen->reflow = false;
 
+  pens_resize_tables(screen, 256);
+  screen->pen_dirty = true;
+
   screen->callbacks = NULL;
   screen->cbdata    = NULL;
   screen->callbacks_has_pushline4 = false;
@@ -1092,6 +1294,7 @@ static VTermScreen *screen_new(VTerm *vt)
   screen->row_ptrs_active = screen->row_ptrs[BUFIDX_PRIMARY];
 
   screen->sb_buffer = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * cols);
+  vterm_scrollback_init(&screen->sb, vt);
 
   vterm_state_set_callbacks(screen->state, &state_cbs, screen);
   vterm_state_callbacks_has_premove(screen->state);
@@ -1109,6 +1312,9 @@ INTERNAL void vterm_screen_free(VTermScreen *screen)
   }
 
   vterm_allocator_free(screen->vt, screen->sb_buffer);
+  vterm_allocator_free(screen->vt, screen->pens);
+  vterm_allocator_free(screen->vt, screen->pen_hash);
+  vterm_scrollback_free(&screen->sb);
 
   vterm_allocator_free(screen->vt, screen);
 }
@@ -1118,6 +1324,9 @@ void vterm_screen_reset(VTermScreen *screen, int hard)
   screen->damaged.start_row = -1;
   screen->pending_scrollrect.start_row = -1;
   vterm_state_reset(screen->state, hard);
+  screen->pen_dirty = true;
+  screen->sb.default_pen = screen->pen;
+  screen->sb.default_pen_valid = true;
   vterm_screen_flush_damage(screen);
 }
 
@@ -1181,31 +1390,6 @@ size_t vterm_screen_get_text(const VTermScreen *screen, char *str, size_t len, c
   return _get_chars(screen, 1, str, len, rect);
 }
 
-/* Copy the pen attributes from an internal ScreenPen to a public VTermScreenCell.
- * This is a separate helper because vterm_screen_get_row reuses the same
- * attributes for runs of identical cells. */
-static inline void set_public_attrs(VTermScreenCell *cell, const ScreenPen *pen, int global_reverse)
-{
-  cell->attrs.bold      = pen->bold;
-  cell->attrs.underline = pen->underline;
-  cell->attrs.italic    = pen->italic;
-  cell->attrs.blink     = pen->blink;
-  cell->attrs.reverse   = pen->reverse ^ global_reverse;
-  cell->attrs.conceal   = pen->conceal;
-  cell->attrs.strike    = pen->strike;
-  cell->attrs.font      = pen->font;
-  cell->attrs.small     = pen->small;
-  cell->attrs.baseline  = pen->baseline;
-
-  cell->attrs.dwl = pen->dwl;
-  cell->attrs.dhl = pen->dhl;
-
-  cell->fg = pen->fg;
-  cell->bg = pen->bg;
-  cell->uline = pen->uline_color;
-  cell->link  = pen->link;
-}
-
 /* Copy internal to external representation of a screen cell */
 int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCell *cell)
 {
@@ -1219,7 +1403,7 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
       break;
   }
 
-  set_public_attrs(cell, &intcell->pen, screen->global_reverse);
+  set_public_attrs(cell, cell_pen(screen, intcell), screen->global_reverse);
 
   if(pos.col < (screen->cols - 1) &&
      getcell(screen, pos.row, pos.col + 1)->chars[0] == (uint32_t)-1)
@@ -1230,16 +1414,12 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
   return 1;
 }
 
-int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *cells, int maxcols)
+/* Converts `limit` cells starting at `rowstart` to the public format */
+static void convert_row(const VTermScreen *screen, const ScreenCell *rowstart, VTermScreenCell *cells, int limit)
 {
-  if(row < 0 || row >= screen->rows || !cells || maxcols <= 0)
-    return 0;
-
-  int limit = maxcols < screen->cols ? maxcols : screen->cols;
-
-  const ScreenCell *rowstart = screen->row_ptrs_active[row];
-  const ScreenPen *last_pen = NULL;
+  uint32_t last_pen = (uint32_t)-1;
   VTermScreenCell cached;
+  memset(&cached, 0, sizeof(cached));
   int global_reverse = screen->global_reverse;
 
   for(int col = 0; col < limit; col++) {
@@ -1249,9 +1429,9 @@ int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *ce
     /* Internal cells keep unused chars[] entries zeroed, so copy them all. */
     memcpy(cell->chars, intcell->chars, sizeof(cell->chars));
 
-    if(!last_pen || memcmp(&intcell->pen, last_pen, sizeof(ScreenPen)) != 0) {
-      set_public_attrs(cell, &intcell->pen, global_reverse);
-      last_pen = &intcell->pen;
+    if(intcell->pen != last_pen) {
+      set_public_attrs(cell, cell_pen(screen, intcell), global_reverse);
+      last_pen = intcell->pen;
       cached.attrs = cell->attrs;
       cached.fg = cell->fg;
       cached.bg = cell->bg;
@@ -1271,6 +1451,17 @@ int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *ce
     else
       cell->width = 1;
   }
+
+}
+
+int vterm_screen_get_row(const VTermScreen *screen, int row, VTermScreenCell *cells, int maxcols)
+{
+  if(row < 0 || row >= screen->rows || !cells || maxcols <= 0)
+    return 0;
+
+  int limit = maxcols < screen->cols ? maxcols : screen->cols;
+
+  convert_row(screen, screen->row_ptrs_active[row], cells, limit);
 
   return limit;
 }
@@ -1378,31 +1569,34 @@ void vterm_screen_set_damage_merge(VTermScreen *screen, VTermDamageSize size)
   screen->damage_merge = size;
 }
 
-static int attrs_differ(VTermAttrMask attrs, ScreenCell *a, ScreenCell *b)
+static int attrs_differ(const VTermScreen *screen, VTermAttrMask attrs, ScreenCell *ca, ScreenCell *cb)
 {
-  if((attrs & VTERM_ATTR_BOLD_MASK)       && (a->pen.bold != b->pen.bold))
+  const ScreenPen *a = cell_pen(screen, ca), *b = cell_pen(screen, cb);
+  if(ca->pen == cb->pen)
+    return 0;
+  if((attrs & VTERM_ATTR_BOLD_MASK)       && (a->bold != b->bold))
     return 1;
-  if((attrs & VTERM_ATTR_UNDERLINE_MASK)  && (a->pen.underline != b->pen.underline))
+  if((attrs & VTERM_ATTR_UNDERLINE_MASK)  && (a->underline != b->underline))
     return 1;
-  if((attrs & VTERM_ATTR_ITALIC_MASK)     && (a->pen.italic != b->pen.italic))
+  if((attrs & VTERM_ATTR_ITALIC_MASK)     && (a->italic != b->italic))
     return 1;
-  if((attrs & VTERM_ATTR_BLINK_MASK)      && (a->pen.blink != b->pen.blink))
+  if((attrs & VTERM_ATTR_BLINK_MASK)      && (a->blink != b->blink))
     return 1;
-  if((attrs & VTERM_ATTR_REVERSE_MASK)    && (a->pen.reverse != b->pen.reverse))
+  if((attrs & VTERM_ATTR_REVERSE_MASK)    && (a->reverse != b->reverse))
     return 1;
-  if((attrs & VTERM_ATTR_CONCEAL_MASK)    && (a->pen.conceal != b->pen.conceal))
+  if((attrs & VTERM_ATTR_CONCEAL_MASK)    && (a->conceal != b->conceal))
     return 1;
-  if((attrs & VTERM_ATTR_STRIKE_MASK)     && (a->pen.strike != b->pen.strike))
+  if((attrs & VTERM_ATTR_STRIKE_MASK)     && (a->strike != b->strike))
     return 1;
-  if((attrs & VTERM_ATTR_FONT_MASK)       && (a->pen.font != b->pen.font))
+  if((attrs & VTERM_ATTR_FONT_MASK)       && (a->font != b->font))
     return 1;
-  if((attrs & VTERM_ATTR_FOREGROUND_MASK) && !vterm_color_is_equal(&a->pen.fg, &b->pen.fg))
+  if((attrs & VTERM_ATTR_FOREGROUND_MASK) && !vterm_color_is_equal(&a->fg, &b->fg))
     return 1;
-  if((attrs & VTERM_ATTR_BACKGROUND_MASK) && !vterm_color_is_equal(&a->pen.bg, &b->pen.bg))
+  if((attrs & VTERM_ATTR_BACKGROUND_MASK) && !vterm_color_is_equal(&a->bg, &b->bg))
     return 1;
-  if((attrs & VTERM_ATTR_SMALL_MASK)    && (a->pen.small != b->pen.small))
+  if((attrs & VTERM_ATTR_SMALL_MASK)    && (a->small != b->small))
     return 1;
-  if((attrs & VTERM_ATTR_BASELINE_MASK)    && (a->pen.baseline != b->pen.baseline))
+  if((attrs & VTERM_ATTR_BASELINE_MASK)    && (a->baseline != b->baseline))
     return 1;
 
   return 0;
@@ -1424,12 +1618,12 @@ int vterm_screen_get_attrs_extent(const VTermScreen *screen, VTermRect *extent, 
   int col;
 
   for(col = pos.col - 1; col >= extent->start_col; col--)
-    if(attrs_differ(attrs, target, getcell(screen, pos.row, col)))
+    if(attrs_differ(screen, attrs, target, getcell(screen, pos.row, col)))
       break;
   extent->start_col = col + 1;
 
   for(col = pos.col + 1; col < extent->end_col; col++)
-    if(attrs_differ(attrs, target, getcell(screen, pos.row, col)))
+    if(attrs_differ(screen, attrs, target, getcell(screen, pos.row, col)))
       break;
   extent->end_col = col - 1;
 
@@ -1443,14 +1637,22 @@ void vterm_screen_convert_color_to_rgb(const VTermScreen *screen, VTermColor *co
 
 static void reset_default_colours(VTermScreen *screen, ScreenCell *buffer)
 {
-  for(int row = 0; row <= screen->rows - 1; row++)
-    for(int col = 0; col <= screen->cols - 1; col++) {
-      ScreenCell *cell = &buffer[row * screen->cols + col];
-      if(VTERM_COLOR_IS_DEFAULT_FG(&cell->pen.fg))
-        cell->pen.fg = screen->pen.fg;
-      if(VTERM_COLOR_IS_DEFAULT_BG(&cell->pen.bg))
-        cell->pen.bg = screen->pen.bg;
+  uint32_t from = (uint32_t)-1, to = 0;
+  screen->pen_gc_lock++;
+  for(int i = 0; i < screen->rows * screen->cols; i++) {
+    ScreenCell *cell = &buffer[i];
+    if(cell->pen != from) {
+      ScreenPen pen = *cell_pen(screen, cell);
+      if(VTERM_COLOR_IS_DEFAULT_FG(&pen.fg))
+        pen.fg = screen->pen.fg;
+      if(VTERM_COLOR_IS_DEFAULT_BG(&pen.bg))
+        pen.bg = screen->pen.bg;
+      from = cell->pen;
+      to = intern_pen(screen, &pen);
     }
+    cell->pen = to;
+  }
+  screen->pen_gc_lock--;
 }
 
 void vterm_screen_set_default_colors(VTermScreen *screen, const VTermColor *default_fg, const VTermColor *default_bg)
@@ -1469,7 +1671,49 @@ void vterm_screen_set_default_colors(VTermScreen *screen, const VTermColor *defa
                         | VTERM_COLOR_DEFAULT_BG;
   }
 
+  screen->pen_dirty = true;
+
+  /* rows stored with the default pen follow the default colours, like the cells on screen */
+  if(screen->sb.default_pen_valid) {
+    if(VTERM_COLOR_IS_DEFAULT_FG(&screen->sb.default_pen.fg))
+      screen->sb.default_pen.fg = screen->pen.fg;
+    if(VTERM_COLOR_IS_DEFAULT_BG(&screen->sb.default_pen.bg))
+      screen->sb.default_pen.bg = screen->pen.bg;
+  }
+
   reset_default_colours(screen, screen->buffers[0]);
   if(screen->buffers[1])
     reset_default_colours(screen, screen->buffers[1]);
+}
+
+void vterm_screen_enable_scrollback(VTermScreen *screen, size_t max_lines, size_t max_bytes)
+{
+  vterm_scrollback_set_limits(&screen->sb, max_lines, max_bytes);
+}
+
+size_t vterm_screen_scrollback_count(const VTermScreen *screen)
+{
+  return screen->sb.count;
+}
+
+size_t vterm_screen_scrollback_bytes(const VTermScreen *screen)
+{
+  return screen->sb.bytes;
+}
+
+int vterm_screen_scrollback_get(const VTermScreen *screen, size_t idx, VTermScreenCell *cells, int maxcols, bool *continuation)
+{
+  int n = vterm_scrollback_get(&screen->sb, idx, cells, maxcols, screen->global_reverse, continuation);
+  return n < 0 ? 0 : n;
+}
+
+void vterm_screen_scrollback_clear(VTermScreen *screen)
+{
+  vterm_scrollback_clear(&screen->sb);
+}
+
+void vterm_screen_scrollback_counters(const VTermScreen *screen, uint64_t *pushed, uint64_t *popped)
+{
+  if(pushed) *pushed = screen->sb.pushed;
+  if(popped) *popped = screen->sb.popped;
 }

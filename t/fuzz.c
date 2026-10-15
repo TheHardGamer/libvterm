@@ -48,14 +48,14 @@ static int popline(int cols,VTermScreenCell*cells,void*u){(void)u;
     memcpy(cells,sb[sbn],(size_t)n*sizeof(VTermScreenCell)); free(sb[sbn]); return 1; }
 
 static const char *frag[] = {
-  "\x1b[","\x1b]","\x1bP","\x1b_","\x1b^","\x1bX","\x1b\\","\x07","\x1b","\x1b[?","\x1b[>","\x1b[<","\x1b[=",
+  "\033[","\033]","\033P","\033_","\033^","\033X","\033\\","\x07","\033","\033[?","\033[>","\033[<","\033[=",
   "m","H","J","K","L","M","P","@","X","S","T","A","B","C","D","E","F","G","d","h","l","r","s","u","c","n","p","q","t","b","I","Z",
   "0","1","2","3","4","5","7","8","9","10","24","80","200","2004","2026","1049","1000","1006","25","7","38;2;","38;5;","48;5;",";",":",
   "\r","\n","\t","\b","\x0e","\x0f","\x84","\x85","\x8d","\x9b","\x9d","\x90",
   "\xcc\x81","\xcc\x82","\xcd\xaf","\xe2\x80\x8d","\xef\xb8\x8f","\xe4\xb8\x80","\xef\xbc\x90","\xf0\x9f\x98\x80","\xc3\xa9","\xce\xb1","\xd0\x96",
   "\xff","\xc0","\xe2\x28","\xf0\x28",
   "hello","The quick brown fox jumps over the lazy dog 0123456789","AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-  "\x1b(0","\x1b(B","\x1b(A","\x1b#3","\x1b#4","\x1b#5","\x1b#6","\x1b[2J","\x1b[3J","\x1bc","\x1b[!p","\x1b7","\x1b8"
+  "\033(0","\033(B","\033(A","\033#3","\033#4","\033#5","\033#6","\033[2J","\033[3J","\033c","\033[!p","\0337","\0338"
 };
 #define NFRAG ((int)(sizeof(frag)/sizeof(frag[0])))
 
@@ -69,9 +69,10 @@ static size_t gen(char *b,size_t cap){
 }
 
 static void on_alarm(int sig){ (void)sig; __sanitizer_print_stack_trace(); fprintf(stderr,"HANG seed=%llu screen=%dx%d\n",(unsigned long long)cur_seed,cur_rows,cur_cols); abort(); }
+static void on_abort(int sig){ (void)sig; fprintf(stderr,"ABORT seed=%llu screen=%dx%d\n",(unsigned long long)cur_seed,cur_rows,cur_cols); _exit(134); }
 static void on_death(void){ fprintf(stderr,"FAILING SEED %llu (screen %dx%d)\n",(unsigned long long)cur_seed,cur_rows,cur_cols); }
 int main(int argc,char**argv){
-  __sanitizer_set_death_callback(on_death); signal(SIGALRM,on_alarm);
+  __sanitizer_set_death_callback(on_death); signal(SIGALRM,on_alarm); signal(SIGABRT,on_abort);
   int secs = argc>1?atoi(argv[1]):30;
   uint64_t seed0 = argc>2?strtoull(argv[2],0,10):1;
   time_t end=time(0)+secs; uint64_t iters=0, bytes=0;
@@ -84,9 +85,16 @@ int main(int argc,char**argv){
     vterm_state_set_callbacks(st,&scb,NULL);
     VTermScreen *sc=vterm_obtain_screen(vt);
     static VTermScreenCallbacks cb; cb.damage=damage; cb.moverect=moverect; cb.movecursor=movecursor; cb.settermprop=settermprop; cb.bell=bell;
-    if(rn(4)) { cb.sb_pushline=pushline; cb.sb_popline=popline; }
+    int libsb = rn(3)==0;
+    if(!libsb && rn(4)) { cb.sb_pushline=pushline; cb.sb_popline=popline; }
     else { cb.sb_pushline=NULL; cb.sb_popline=NULL; }
     vterm_screen_set_callbacks(sc,&cb,NULL);
+    if(libsb){ int l=1+rn(300), b=1+rn(rn(2)?4000:2000000); (void)l; (void)b;
+#ifndef NO_LIBSB
+      vterm_screen_enable_scrollback(sc,l,b);
+#endif
+    }
+    vterm_screen_enable_altscreen(sc,rn(2));
     { const char*e=getenv("FUZZ_REFLOW"); int m=e?atoi(e):2; int r=rn(2); vterm_screen_enable_reflow(sc, m==2?r:m); }
     vterm_screen_set_sb_trim(sc,rn(2));
     vterm_screen_set_damage_merge(sc,(VTermDamageSize)rn(4));
@@ -106,7 +114,14 @@ int main(int argc,char**argv){
       else if(what==7){ rows=1+rn(50); cols=1+rn(200); cur_rows=rows; cur_cols=cols; vterm_set_size(vt,rows,cols); }
       else if(what==8){ vterm_screen_flush_damage(sc);
         VTermScreenCell cell; for(int k=0;k<20;k++){ VTermPos p={rn(rows),rn(cols)}; vterm_screen_get_cell(sc,p,&cell); }
-        char text[4096]; VTermRect r={0,rows,0,cols}; vterm_screen_get_text(sc,text,sizeof text,r); }
+        char text[4096]; VTermRect r={0,rows,0,cols}; vterm_screen_get_text(sc,text,sizeof text,r);
+#ifndef NO_LIBSB
+        if(libsb){ static VTermScreenCell row[512]; size_t n=vterm_screen_scrollback_count(sc);
+          for(int k=0;k<10 && n;k++){ bool cont; int w=vterm_screen_scrollback_get(sc,(size_t)rn((int)n),row,1+rn(512),&cont); (void)w; }
+          if(rn(5)==0) vterm_screen_enable_scrollback(sc,1+rn(300),1+rn(100000));
+          if(rn(20)==0) vterm_screen_scrollback_clear(sc); }
+#endif
+      }
       else { vterm_keyboard_unichar(vt,0x41+rn(30),VTERM_MOD_NONE); vterm_keyboard_key(vt,(VTermKey)(1+rn(12)),VTERM_MOD_NONE);
              vterm_mouse_move(vt,rn(rows),rn(cols),VTERM_MOD_NONE); vterm_mouse_button(vt,1+rn(3),rn(2),VTERM_MOD_NONE);
              size_t n=vterm_output_get_buffer_current(vt); (void)n; vterm_output_read(vt,(char[256]){0},256); }

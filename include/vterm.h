@@ -587,6 +587,36 @@ void vterm_screen_set_sb_trim(VTermScreen *screen, bool trim);
 const char *vterm_screen_get_hyperlink(const VTermScreen *screen, uint32_t id);
 #define VTERM_HAS_SB_TRIM 1
 
+/**
+ * Let the screen keep the rows that scroll off the top, instead of handing each
+ * one to sb_pushline / sb_pushline4. Rows are stored compactly (a plain ASCII
+ * row takes about one byte per cell) and trailing blank cells are dropped. The
+ * oldest rows are discarded once there are more than `max_lines` of them or
+ * they take more than `max_bytes`. Both zero turns the store off (and empties it);
+ * calling again with other limits trims it to fit.
+ *
+ * While the store is on, sb_pushline and sb_popline are not called; resizing
+ * pulls rows back out of the store by itself.
+ */
+void vterm_screen_enable_scrollback(VTermScreen *screen, size_t max_lines, size_t max_bytes);
+
+/** Number of stored rows, and the memory they take */
+size_t vterm_screen_scrollback_count(const VTermScreen *screen);
+size_t vterm_screen_scrollback_bytes(const VTermScreen *screen);
+
+/**
+ * Expands stored row `idx` (0 is the oldest) into `cells`, at most `maxcols` of
+ * them, and returns how many were written (the row's trimmed width; 0 if `idx`
+ * is out of range). `*continuation` is set to whether the row continues the
+ * line before it.
+ */
+int vterm_screen_scrollback_get(const VTermScreen *screen, size_t idx, VTermScreenCell *cells, int maxcols, bool *continuation);
+
+void vterm_screen_scrollback_clear(VTermScreen *screen);
+
+/** Running totals of rows pushed to and popped from the store */
+void vterm_screen_scrollback_counters(const VTermScreen *screen, uint64_t *pushed, uint64_t *popped);
+
 // Back-compat alias for the brief time it was in 0.3-RC1
 #define vterm_screen_set_reflow  vterm_screen_enable_reflow
 

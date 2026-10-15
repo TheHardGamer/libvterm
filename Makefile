@@ -83,6 +83,7 @@ t/harness: t/harness.lo $(LIBRARY)
 .PHONY: test
 test: $(LIBRARY) t/harness
 	for T in `ls t/[0-9]*.test`; do echo "** $$T **"; perl t/run-test.pl $$T $(if $(VALGRIND),--valgrind) || exit 1; done
+	$(CC) $(CFLAGS) -Isrc t/scrollback.c src/*.c -o t/scrollback && ./t/scrollback
 
 .PHONY: clean
 clean:

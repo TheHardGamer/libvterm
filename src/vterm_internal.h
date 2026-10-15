@@ -320,5 +320,6 @@ VTermEncoding *vterm_lookup_encoding(VTermEncodingType type, char designation);
 int vterm_unicode_width(uint32_t codepoint);
 int vterm_unicode_is_combining(uint32_t codepoint);
 int vterm_unicode_is_plain(uint32_t codepoint); /* width 1 and not combining */
+int vterm_unicode_plain_width(uint32_t codepoint); /* 1 or 2 if not combining, else 0 */
 
 #endif

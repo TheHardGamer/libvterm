@@ -1,3 +1,4 @@
+#include <string.h>
 #include "vterm_internal.h"
 
 #include <stdio.h>
@@ -167,25 +168,48 @@ INTERNAL void vterm_state_newpen(VTermState *state)
     lookup_default_colour_ansi(col, &state->colors[col]);
 }
 
-INTERNAL void vterm_state_resetpen(VTermState *state)
+static inline int color_same(const VTermColor *a, const VTermColor *b)
 {
-  state->pen.bold = 0;      setpenattr_bool(state, VTERM_ATTR_BOLD, 0);
-  state->pen.underline = 0; setpenattr_int (state, VTERM_ATTR_UNDERLINE, 0);
-  state->pen.italic = 0;    setpenattr_bool(state, VTERM_ATTR_ITALIC, 0);
-  state->pen.blink = 0;     setpenattr_bool(state, VTERM_ATTR_BLINK, 0);
-  state->pen.reverse = 0;   setpenattr_bool(state, VTERM_ATTR_REVERSE, 0);
-  state->pen.conceal = 0;   setpenattr_bool(state, VTERM_ATTR_CONCEAL, 0);
-  state->pen.strike = 0;    setpenattr_bool(state, VTERM_ATTR_STRIKE, 0);
-  state->pen.font = 0;      setpenattr_int (state, VTERM_ATTR_FONT, 0);
-  state->pen.small = 0;     setpenattr_bool(state, VTERM_ATTR_SMALL, 0);
-  state->pen.baseline = 0;  setpenattr_int (state, VTERM_ATTR_BASELINE, 0);
+  return memcmp(a, b, sizeof(*a)) == 0;
+}
 
-  state->pen.fg = state->default_fg;  setpenattr_col(state, VTERM_ATTR_FOREGROUND, state->default_fg);
-  state->pen.bg = state->default_bg;  setpenattr_col(state, VTERM_ATTR_BACKGROUND, state->default_bg);
+/* With force == 0 the screen is only told about attributes that actually change, which makes a
+ * run of "SGR 0" cheap: the pen is usually reset already. Force it after the screen's own pen
+ * may have been reset (a full reset), when it has to hear about every attribute. */
+static void resetpen(VTermState *state, int force)
+{
+#define RESET_ATTR(field, notify) if(force || state->pen.field) { state->pen.field = 0; notify; }
+  RESET_ATTR(bold,      setpenattr_bool(state, VTERM_ATTR_BOLD, 0))
+  RESET_ATTR(underline, setpenattr_int (state, VTERM_ATTR_UNDERLINE, 0))
+  RESET_ATTR(italic,    setpenattr_bool(state, VTERM_ATTR_ITALIC, 0))
+  RESET_ATTR(blink,     setpenattr_bool(state, VTERM_ATTR_BLINK, 0))
+  RESET_ATTR(reverse,   setpenattr_bool(state, VTERM_ATTR_REVERSE, 0))
+  RESET_ATTR(conceal,   setpenattr_bool(state, VTERM_ATTR_CONCEAL, 0))
+  RESET_ATTR(strike,    setpenattr_bool(state, VTERM_ATTR_STRIKE, 0))
+  RESET_ATTR(font,      setpenattr_int (state, VTERM_ATTR_FONT, 0))
+  RESET_ATTR(small,     setpenattr_bool(state, VTERM_ATTR_SMALL, 0))
+  RESET_ATTR(baseline,  setpenattr_int (state, VTERM_ATTR_BASELINE, 0))
+#undef RESET_ATTR
+
+  if(force || !color_same(&state->pen.fg, &state->default_fg)) {
+    state->pen.fg = state->default_fg;
+    setpenattr_col(state, VTERM_ATTR_FOREGROUND, state->default_fg);
+  }
+  if(force || !color_same(&state->pen.bg, &state->default_bg)) {
+    state->pen.bg = state->default_bg;
+    setpenattr_col(state, VTERM_ATTR_BACKGROUND, state->default_bg);
+  }
 
   /* "Same as the foreground". SGR 0 deliberately leaves the OSC 8 hyperlink alone. */
-  state->pen.uline_color = state->default_fg;
-  setpenattr_col(state, VTERM_ATTR_UNDERLINE_COLOR, state->pen.uline_color);
+  if(force || !color_same(&state->pen.uline_color, &state->default_fg)) {
+    state->pen.uline_color = state->default_fg;
+    setpenattr_col(state, VTERM_ATTR_UNDERLINE_COLOR, state->pen.uline_color);
+  }
+}
+
+INTERNAL void vterm_state_resetpen(VTermState *state)
+{
+  resetpen(state, 1);
 }
 
 INTERNAL void vterm_state_savepen(VTermState *state, int save)
@@ -295,7 +319,7 @@ INTERNAL void vterm_state_setpen(VTermState *state, const long args[], int argco
     switch(arg = CSI_ARG(args[argi])) {
     case CSI_ARG_MISSING:
     case 0: // Reset
-      vterm_state_resetpen(state);
+      resetpen(state, 0);
       break;
 
     case 1: { // Bold on

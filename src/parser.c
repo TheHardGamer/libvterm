@@ -115,7 +115,7 @@ static void string_fragment(VTerm *vt, const char *str, size_t len, bool final)
 size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
 {
   size_t pos = 0;
-  const char *string_start;
+  const char *string_start = NULL;
 
   switch(vt->parser.state) {
   case NORMAL:
@@ -143,6 +143,83 @@ size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
   for( ; pos < len; pos++) {
     unsigned char c = bytes[pos];
     bool c1_allowed = !vt->mode.utf8;
+
+    /* Fast paths, chosen by state. They only handle the common bytes and leave everything else
+     * (control characters, ESC, intermediates, C1) to the general code below. */
+    const int state_now = vt->parser.state;
+
+    if(vt->parser.in_esc) {
+      /* general code */
+    }
+    else if(state_now == NORMAL) {
+      /* Printable text goes straight to the text callback */
+      if(c >= 0x20 && c != 0x7f && (c < 0x80 || !c1_allowed)) {
+        size_t eaten = 0;
+        if(vt->parser.callbacks && vt->parser.callbacks->text)
+          eaten = (*vt->parser.callbacks->text)(bytes + pos, len - pos, vt->parser.cbdata);
+        if(!eaten)
+          eaten = 1; /* force it to make progress */
+        pos += eaten - 1;
+        continue;
+      }
+    }
+    else if(state_now == CSI_ARGS) {
+      /* The parameters of a CSI sequence: digits, ';' and ':' in a tight loop, then the final byte */
+      long *args = vt->parser.v.csi.args;
+      int argi = vt->parser.v.csi.argi;
+      for( ; pos < len; pos++) {
+        c = bytes[pos];
+        if(c >= '0' && c <= '9') {
+          long *arg = &args[argi];
+          if(*arg == CSI_ARG_MISSING)
+            *arg = 0;
+          /* Saturate at CSI_ARG_LIMIT instead of overflowing, see below */
+          if(*arg > (CSI_ARG_LIMIT - (c - '0')) / 10)
+            *arg = CSI_ARG_LIMIT;
+          else
+            *arg = *arg * 10 + (c - '0');
+        }
+        else if(c == ';' || c == ':') {
+          if(c == ':')
+            args[argi] |= CSI_ARG_FLAG_MORE;
+          args[++argi] = CSI_ARG_MISSING;
+        }
+        else
+          break;
+      }
+      vt->parser.v.csi.argi = argi;
+      if(pos >= len)
+        break;
+      if(c >= 0x40 && c <= 0x7e) {
+        /* the final byte */
+        vt->parser.v.csi.argi++;
+        vt->parser.intermedlen = 0;
+        vt->parser.intermed[0] = 0;
+        do_csi(vt, c);
+        ENTER_NORMAL_STATE();
+        continue;
+      }
+      /* otherwise handle byte c the general way */
+    }
+    else if(state_now == OSC || state_now == DCS || state_now == APC || state_now == PM || state_now == SOS) {
+      /* The body of a string: nothing to do for ordinary bytes, so skip to the next one that
+       * ends it or is special (a control character, DEL, or C1 ST when C1 is in use) */
+      size_t p = pos;
+      if(c1_allowed) {
+        while(p < len && (unsigned char)bytes[p] >= 0x20 && (unsigned char)bytes[p] != 0x7f && (unsigned char)bytes[p] != 0x9c)
+          p++;
+      }
+      else {
+        while(p < len && (unsigned char)bytes[p] >= 0x20 && (unsigned char)bytes[p] != 0x7f)
+          p++;
+      }
+      if(p >= len) {
+        pos = len;
+        break;
+      }
+      pos = p;
+      c = bytes[pos];
+    }
 
     if(c == 0x00 || c == 0x7f) { // NUL, DEL
       if(IS_STRING_STATE()) {
