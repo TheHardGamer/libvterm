@@ -141,7 +141,7 @@ struct VTermState
   unsigned int protected_cell : 1;
 
   /* Saved state under DEC mode 1048/1049 */
-  struct {
+  struct VTermSavedCursor {
     VTermPos pos;
     struct VTermPen pen;
 
@@ -151,6 +151,11 @@ struct VTermState
       unsigned int cursor_shape:2;
     } mode;
   } saved;
+
+  /* Cursor saved by DEC mode 1049 on entering the altscreen. Programs on the altscreen use
+   * DECSC/DECRC (ESC 7 / ESC 8) themselves, which would overwrite `saved`; the main screen's
+   * cursor (and its visibility) must survive that. */
+  struct VTermSavedCursor saved_1049;
 
   /* OSC 8 hyperlinks. Link ids count up from 1; the entry for id N lives in
    * slot (N-1) % LINK_TABLE_SIZE, so only the most recent LINK_TABLE_SIZE links

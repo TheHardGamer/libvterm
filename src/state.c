@@ -1055,8 +1055,16 @@ static void set_dec_mode(VTermState *state, int num, int val)
     break;
 
   case 1049:
-    settermprop_bool(state, VTERM_PROP_ALTSCREEN, val);
-    savecursor(state, val);
+    if(val) {
+      savecursor(state, 1);
+      state->saved_1049 = state->saved;
+      settermprop_bool(state, VTERM_PROP_ALTSCREEN, 1);
+    }
+    else {
+      settermprop_bool(state, VTERM_PROP_ALTSCREEN, 0);
+      state->saved = state->saved_1049;
+      savecursor(state, 0);
+    }
     break;
 
   case 2004:
