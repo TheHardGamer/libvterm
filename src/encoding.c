@@ -1,5 +1,7 @@
 #include "vterm_internal.h"
 
+#include <string.h>
+
 #define UNICODE_INVALID 0xFFFD
 
 #if defined(DEBUG) && DEBUG > 1
@@ -25,6 +27,13 @@ static void init_utf8(VTermEncoding *enc, void *data_)
   data->bytes_total     = 0;
 }
 
+/* Nonzero if any byte of the 8 in `x` is below `n` (n <= 128) / above `n` (n <= 127), the classic
+ * word-at-a-time tests. They are exact for "is there any such byte" (a nonzero result may flag extra
+ * bytes above a real hit, which does not matter here). Bytes with the top bit set count as "above". */
+#define UTF8_ONES (~(uint64_t)0 / 255)
+#define UTF8_ANY_LESS(x, n) (((x) - UTF8_ONES * (n)) & ~(x) & UTF8_ONES * 128)
+#define UTF8_ANY_MORE(x, n) ((((x) + UTF8_ONES * (127 - (n))) | (x)) & UTF8_ONES * 128)
+
 static void decode_utf8(VTermEncoding *enc, void *data_,
                         uint32_t cp[], int *cpi, int cplen,
                         const char bytes[], size_t *pos, size_t bytelen)
@@ -46,14 +55,47 @@ static void decode_utf8(VTermEncoding *enc, void *data_,
       return;
 
     else if(c >= 0x20 && c < 0x7f) {
-      if(data->bytes_remaining)
+      if(data->bytes_remaining) {
         cp[(*cpi)++] = UNICODE_INVALID;
+        data->bytes_remaining = 0;
+        /* A broken sequence takes two slots, the replacement character and this one. With one left,
+         * c stays unread and goes into the next call: writing it would run past cp[cplen]. */
+        if(*cpi >= cplen)
+          return;
+      }
 
       cp[(*cpi)++] = c;
 #ifdef DEBUG_PRINT_UTF8
       printf(" UTF-8 char: U+%04x\n", c);
 #endif
       data->bytes_remaining = 0;
+
+      /* Fast path: a printable ASCII byte followed by more of them. Take the rest of the run 8 bytes at a
+       * time. A window with a byte that is not printable ASCII still gives up the good bytes in front of it.
+       * Only reached after an ASCII byte, so multi-byte text does not pay for it. */
+      if(bytelen - *pos > 8 && (unsigned)(unsigned char)bytes[*pos + 1] - 0x20 < 0x5f) {
+        while(bytelen - *pos > 8 && cplen - *cpi >= 8) {
+          uint64_t w;
+          memcpy(&w, bytes + *pos + 1, 8);
+          uint64_t bad = UTF8_ANY_LESS(w, 0x20) | UTF8_ANY_MORE(w, 0x7e);
+          int good = 8;
+          if(bad) {
+#if defined(__GNUC__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            /* The lowest flagged byte is always a real hit (carries only run upwards) */
+            good = __builtin_ctzll(bad) >> 3;
+#else
+            break;
+#endif
+          }
+          /* cp has room for 8: store all 8, keep `good` of them */
+          for(int i = 0; i < 8; i++)
+            cp[*cpi + i] = (unsigned char)bytes[*pos + 1 + i];
+          *pos += good;
+          *cpi += good;
+          if(good < 8)
+            break;
+        }
+      }
     }
 
     else if(c == 0x7f) // DEL

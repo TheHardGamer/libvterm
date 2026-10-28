@@ -84,6 +84,8 @@ t/harness: t/harness.lo $(LIBRARY)
 test: $(LIBRARY) t/harness
 	for T in `ls t/[0-9]*.test`; do echo "** $$T **"; perl t/run-test.pl $$T $(if $(VALGRIND),--valgrind) || exit 1; done
 	$(CC) $(CFLAGS) -Isrc t/scrollback.c src/*.c -o t/scrollback && ./t/scrollback
+	$(CC) $(CFLAGS) -Isrc t/reflow.c src/*.c -o t/reflow && ./t/reflow
+	$(CC) $(CFLAGS) -Isrc t/utf8_decode.c src/*.c -o t/utf8_decode && ./t/utf8_decode
 
 .PHONY: clean
 clean:
