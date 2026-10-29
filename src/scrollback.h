@@ -50,6 +50,9 @@ INTERNAL int vterm_scrollback_get(const VTermScrollback *sb, size_t idx, VTermSc
 /* Removes the newest row and expands it like vterm_scrollback_get; -1 if empty */
 INTERNAL int vterm_scrollback_pop(VTermScrollback *sb, VTermScreenCell *cells, int maxcols, int global_reverse, bool *continuation);
 
+/* Number of cells stored for the newest row (0 if empty) */
+INTERNAL int vterm_scrollback_newest_cols(const VTermScrollback *sb);
+
 INTERNAL void vterm_scrollback_blank_cell(const VTermScrollback *sb, VTermScreenCell *cell, int global_reverse);
 
 #endif

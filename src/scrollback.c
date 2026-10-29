@@ -445,6 +445,15 @@ INTERNAL int vterm_scrollback_pop(VTermScrollback *sb, VTermScreenCell *cells, i
   return n;
 }
 
+INTERNAL int vterm_scrollback_newest_cols(const VTermScrollback *sb)
+{
+  if(!sb->count)
+    return 0;
+  uint16_t cols;
+  memcpy(&cols, line_at(sb, sb->count - 1) + 4, 2);
+  return cols;
+}
+
 INTERNAL void vterm_scrollback_blank_cell(const VTermScrollback *sb, VTermScreenCell *cell, int global_reverse)
 {
   ScreenPen pen;

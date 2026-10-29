@@ -114,7 +114,7 @@ int main(int argc,char**argv){
     if(!lib){ cb.sb_pushline=pushline; cb.sb_popline=popline;
     cb.sb_clear=clearsb; }
     vterm_screen_set_callbacks(sc,&cb,NULL);
-    { int r = rn(2); vterm_screen_enable_reflow(sc, getenv("REFLOW") ? r : 0); } /* reflow can still crash in resize_buffer, see the README */
+    { int r = rn(2); vterm_screen_enable_reflow(sc, getenv("REFLOW") ? r : 0); }
     vterm_screen_enable_altscreen(sc, getenv("ALT") ? 1 : 0);
     vterm_screen_set_sb_trim(sc,1);
     vterm_screen_set_damage_merge(sc,VTERM_DAMAGE_ROW);

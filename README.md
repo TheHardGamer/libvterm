@@ -45,6 +45,21 @@ All the values follow MB/s unit
 | Long escape codes                    | 3200             | 3300                               |
 | Images                               | 3300             | 3300                               |
 
+To reproduce it on your own machine, build `t/bench_replay.c` like the library and run it on one pinned
+core. It replays `t/data/kitten-benchmark.bin.gz`, data recorded from kitten's benchmark (kitten itself is
+not needed): the header of `t/bench_replay.c` has the exact commands. Run two builds on the same file,
+taking turns, to compare them. `t/make_bench_data.py` remakes the data file from a kitten binary.
+
+## Reflow
+
+With `vterm_screen_enable_reflow()` a resize re-wraps the lines of the primary screen. With the library
+scrollback it also pulls the scrollback lines the top of the screen continues (and enough older ones to
+fill a taller screen) into the resize and hands back what does not fit, so a line is never cut
+between scrollback and screen, and growing the window rejoins what shrinking wrapped. A double-width
+character is never split at the edge. The alternate screen is not reflowed. The work happens only on a
+resize, at a cost of the screen plus the lines pulled, whatever the size of the history (about 75 us
+for 40x150 with 100000 rows of history); reflow off keeps the old behaviour and the same throughput.
+
 ## Testing
 
 The test suite is in `t/`. Each `t/*.test` file is a script of input, and the expected
@@ -64,6 +79,11 @@ ASAN_OPTIONS=detect_leaks=1 perl t/run-test.pl t/10state_putglyph.test -e /tmp/h
 
 `t/scrollback.c` checks the library-managed scrollback (`make test` runs it too).
 
+`t/reflow.c` checks that reflow keeps the text: it joins scrollback and screen rows back into logical
+lines and compares them after shrinking and growing (wide characters, the alternate screen, lines that
+spilled into the scrollback), then runs random text through random resize sequences and requires the
+logical lines to stay exactly what was written.
+
 `t/compare.c` runs the same random input through two builds, or through the callback and the
 library way of keeping scrollback, and prints everything observable (every cell, the cursor, every
 stored row) so the outputs can be diffed. Against a build of an older commit, and between the two
@@ -82,4 +102,4 @@ FUZZ_REFLOW=0 ./fuzz 1 4341   # replay one seed
 
 Environment variables for the fuzzer: , and `FUZZ_CHUNK1=1` feeds input one byte at a time.
 
-Reflow (`FUZZ_REFLOW=1`) is fuzzed too now: its out-of-range read in `resize_buffer()` (a top row that continues a line already scrolled off) and an `abort()` when the cursor got lost are fixed.
+Reflow (`FUZZ_REFLOW=1`) is fuzzed too: its out-of-range read in `resize_buffer()` (a top row that continues a line already scrolled off) and an `abort()` when the cursor got lost are fixed.
