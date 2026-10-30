@@ -50,7 +50,7 @@ static int popline(int cols,VTermScreenCell*cells,void*u){(void)u;
 static const char *frag[] = {
   "\033[","\033]","\033P","\033_","\033^","\033X","\033\\","\x07","\033","\033[?","\033[>","\033[<","\033[=",
   "m","H","J","K","L","M","P","@","X","S","T","A","B","C","D","E","F","G","d","h","l","r","s","u","c","n","p","q","t","b","I","Z",
-  "0","1","2","3","4","5","7","8","9","10","24","80","200","2004","2026","1049","1000","1006","25","7","38;2;","38;5;","48;5;",";",":",
+  "0","1","2","3","4","5","7","8","9","10","24","80","200","2004","2026","1049","133;A","133;C","133;D;0","1000","1006","25","7","38;2;","38;5;","48;5;",";",":",
   "\r","\n","\t","\b","\x0e","\x0f","\x84","\x85","\x8d","\x9b","\x9d","\x90",
   "\xcc\x81","\xcc\x82","\xcd\xaf","\xe2\x80\x8d","\xef\xb8\x8f","\xe4\xb8\x80","\xef\xbc\x90","\xf0\x9f\x98\x80","\xc3\xa9","\xce\xb1","\xd0\x96",
   "\xff","\xc0","\xe2\x28","\xf0\x28",
@@ -111,7 +111,7 @@ int main(int argc,char**argv){
             fprintf(stderr,"CURSOR OUT OF RANGE seed=%llu screen=%dx%d cursor=(%d,%d) before=(%d,%d) input:",(unsigned long long)cur_seed,rows,cols,cp.row,cp.col,before.row,before.col);
             for(size_t q=0;q<c;q++) fprintf(stderr," %02x",(unsigned char)buf[off+q]); fprintf(stderr,"\n"); abort(); }
           off+=c; } bytes+=n; }
-      else if(what==7){ rows=1+rn(50); cols=1+rn(200); cur_rows=rows; cur_cols=cols; vterm_set_size(vt,rows,cols); }
+      else if(what==7){ rows=1+rn(50); cols=1+rn(200); cur_rows=rows; cur_cols=cols; vterm_set_size(vt,rows,cols); if(rn(2)) vterm_screen_rewrap_scrollback(sc); }
       else if(what==8){ vterm_screen_flush_damage(sc);
         VTermScreenCell cell; for(int k=0;k<20;k++){ VTermPos p={rn(rows),rn(cols)}; vterm_screen_get_cell(sc,p,&cell); }
         char text[4096]; VTermRect r={0,rows,0,cols}; vterm_screen_get_text(sc,text,sizeof text,r);

@@ -172,6 +172,9 @@ struct VTermState
   size_t osc8_len;
   bool osc8_overflow;
 
+  /* A program has sent OSC 133. Until then no row has a mark, so there is nothing to clear */
+  bool osc133_seen;
+
   /* Temporary state for DECRQSS parsing */
   union {
     char decrqss[4];

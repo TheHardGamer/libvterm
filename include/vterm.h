@@ -304,7 +304,14 @@ typedef struct {
   unsigned int    doublewidth:1;     /* DECDWL or DECDHL line */
   unsigned int    doubleheight:2;    /* DECDHL line (1=top 2=bottom) */
   unsigned int    continuation:1;    /* Line is a flow continuation of the previous */
+  unsigned int    marks:3;           /* VTERM_LINEMARK_* set by OSC 133 shell integration on this row */
 } VTermLineInfo;
+
+/* OSC 133 marks. A row can carry several: the finished mark of one command and the prompt of the next
+ * usually share a row. They stay with the text through scrolling, scrollback and reflow. */
+#define VTERM_LINEMARK_PROMPT  1  /* 133;A  a prompt starts on this row */
+#define VTERM_LINEMARK_OUTPUT  2  /* 133;C  a command's output starts on this row */
+#define VTERM_LINEMARK_DONE    4  /* 133;D  a command finished on this row */
 
 /* Copies of VTermState fields that the 'resize' callback might have reason to
  * edit. 'resize' callback gets total control of these fields and may
@@ -611,6 +618,19 @@ size_t vterm_screen_scrollback_bytes(const VTermScreen *screen);
  * line before it.
  */
 int vterm_screen_scrollback_get(const VTermScreen *screen, size_t idx, VTermScreenCell *cells, int maxcols, bool *continuation);
+
+/* Cuts the scrollback rows that are wider than the screen into rows of its width, so a window that was
+ * made narrower does not show them cut off. It reads the whole history, so call it once the resizing
+ * has stopped, not on every step. Returns how many rows it cut (0 if none was too wide, so nothing changed).
+ * Not the change in the number of rows: a full history drops the oldest rows as the cut ones are added. */
+int vterm_screen_rewrap_scrollback(VTermScreen *screen);
+
+/* The number of cells stored for scrollback row `idx`: the width it had when it scrolled off, which can
+ * differ from the current one (history is re-wrapped only as far as a resize pulls it back) */
+int vterm_screen_scrollback_width(const VTermScreen *screen, size_t idx);
+
+/* The VTERM_LINEMARK_* bits of scrollback row `idx` (0 is the oldest), 0 if out of range */
+unsigned vterm_screen_scrollback_marks(const VTermScreen *screen, size_t idx);
 
 void vterm_screen_scrollback_clear(VTermScreen *screen);
 

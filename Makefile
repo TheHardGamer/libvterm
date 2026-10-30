@@ -87,6 +87,11 @@ test: $(LIBRARY) t/harness
 	$(CC) $(CFLAGS) -Isrc t/reflow.c src/*.c -o t/reflow && ./t/reflow
 	$(CC) $(CFLAGS) -Isrc t/utf8_decode.c src/*.c -o t/utf8_decode && ./t/utf8_decode
 
+.PHONY: bench
+bench:
+	$(CC) -O3 -flto=auto -DNDEBUG -std=gnu99 -Iinclude -Isrc t/vtbench.c src/[a-z]*.c -o t/vtbench
+	./t/vtbench
+
 .PHONY: clean
 clean:
 	$(LIBTOOL) --mode=clean rm -f $(OBJECTS) $(INCFILES)

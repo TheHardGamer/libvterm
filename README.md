@@ -34,21 +34,52 @@ A fork of libvterm from neovim with some updates and fixes
 
 ## Performance
 
-kitten benchmark on library only, no rendering or pty, 150x40 screen, one pinned core of an i9-13950HX:
-All the values follow MB/s unit
-| Category                             | Alternate screen | Primary screen, library scrollback |
-|--------------------------------------|------------------|------------------------------------|
-| ASCII                                | 173              | 110                                |
-| Unicode                              | 322              | 226                                |
-| Unique multi-codepoint Unicode cells | 199              | 170                                |
-| CSI codes with few chars             | 169              | 165                                |
-| Long escape codes                    | 3200             | 3300                               |
-| Images                               | 3300             | 3300                               |
+`t/vtbench.c` is the benchmark suite. It uses only the public API, so one file builds against any revision of
+the library, and it makes its input itself from a fixed seed: nothing to download. The terminal is set up the way
+the application sets it up (150x40, library scrollback, reflow on, damage callbacks), with no rendering and no pty.
 
-To reproduce it on your own machine, build `t/bench_replay.c` like the library and run it on one pinned
-core. It replays `t/data/kitten-benchmark.bin.gz`, data recorded from kitten's benchmark (kitten itself is
-not needed): the header of `t/bench_replay.c` has the exact commands. Run two builds on the same file,
-taking turns, to compare them. `t/make_bench_data.py` remakes the data file from a kitten binary.
+| Workload            | What is in it                                                             |
+|---------------------|---------------------------------------------------------------------------|
+| `ascii_lines`       | lines of 40-80 characters, scrolling into the scrollback                  |
+| `ascii_long_lines`  | lines of 250-400 characters, wrapping on a 150 column screen              |
+| `unicode_mixed`     | ASCII with wide (CJK), combining, Cyrillic and emoji characters           |
+| `sgr_colors`        | text with a colour or attribute change every few words                    |
+| `csi_cursor`        | cursor addressing, erase, insert and delete characters                    |
+| `scroll_region`     | `DECSTBM`, insert/delete lines, scroll up/down (an editor scrolling)      |
+| `fullscreen_redraw` | the alternate screen redrawn over and over in colours (a TUI)             |
+| `osc_and_marks`     | titles, OSC 8 links, OSC 7, and OSC 133 marks around short lines          |
+| `osc_without_marks` / `osc133_marks_only` | the two halves of the one above                     |
+| `long_escapes`      | very long OSC, DCS and APC strings                                        |
+
+and three operations, in milliseconds: `resize_drag` (a resize step with 100000 rows of history),
+`resize_height`, and `rewrap_*` (cutting the history to a narrower screen).
+
+**Timed run**, to see the speed in MiB/s: `make bench`, or build it yourself and pin it to one core
+(the header of `t/vtbench.c` has the options):
+
+    cc -O3 -flto=auto -DNDEBUG -std=gnu99 -Iinclude -Isrc t/vtbench.c src/[a-z]*.c -o t/vtbench
+    taskset -c 3 ./t/vtbench 1.0 5          # seconds per trial, trials; add a name to run only that one
+
+Typical numbers, i9-13950HX under WSL2 on one pinned core (about 5% from run to run, 10% on the OSC ones):
+
+| Workload            | MiB/s |
+|---------------------|-------|
+| `ascii_lines`       | 160   |
+| `ascii_long_lines`  | 240   |
+| `unicode_mixed`     | 90    |
+| `sgr_colors`        | 125   |
+| `csi_cursor`        | 175   |
+| `scroll_region`     | 310   |
+| `fullscreen_redraw` | 260   |
+| `osc_and_marks`     | 70    |
+| `long_escapes`      | 2750  |
+
+**Comparing two builds**: `t/vtbench-compare.sh` builds the suite against git revisions, counts instructions under valgrind and
+prints a table with the first revision as the reference. `WORKTREE` is the files as they are now:
+
+    t/vtbench-compare.sh HEAD WORKTREE
+    t/vtbench-compare.sh 333a755 HEAD WORKTREE
+    t/vtbench-compare.sh --mib 4 v1.0 WORKTREE
 
 ## Reflow
 
@@ -59,6 +90,21 @@ between scrollback and screen, and growing the window rejoins what shrinking wra
 character is never split at the edge. The alternate screen is not reflowed. The work happens only on a
 resize, at a cost of the screen plus the lines pulled, whatever the size of the history (about 75 us
 for 40x150 with 100000 rows of history); reflow off keeps the old behaviour and the same throughput.
+
+History rows keep the width they scrolled off with, so after the window gets narrower the part of a row past the
+right edge is out of sight. `vterm_screen_rewrap_scrollback()` cuts the rows that are too wide into rows of the
+screen's width (text, wrap flags and OSC 133 marks kept). It reads the whole history, so call it once resizing
+has stopped, not on every step; it is a single check when no row is too wide, and returns how many rows it cut. With 100000 rows of history it takes
+about 30 ms when a quarter of the rows are too wide and 290 ms when all of them are.
+
+## OSC 133 marks
+
+`ESC ] 133 ; A|C|D` (prompt start, output start, command done) sets a `VTERM_LINEMARK_*` bit on the row
+the cursor is on, in `VTermLineInfo.marks`. The marks stay with the text: they are stored in the spare
+bits of the per-row info and of the scrollback record (no extra memory, no extra work while scrolling),
+and a reflow puts the marks of a wrapped line on its first row. A row fully erased loses its marks and
+the alternate screen takes none. Read them with `vterm_state_get_lineinfo()` for the screen and
+`vterm_screen_scrollback_marks()` for the scrollback.
 
 ## Testing
 

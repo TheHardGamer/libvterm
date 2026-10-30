@@ -20,6 +20,7 @@ enum {
   SB_CONTINUATION = 1 << 0,
   SB_PENS_DEFAULT = 1 << 1, /* every cell has the default pen: nothing stored */
   SB_PENS_ONE     = 1 << 2, /* every cell has the same pen: stored once */
+  SB_MARKS_SHIFT  = 3,      /* three bits: VTERM_LINEMARK_* */
   /* neither: u16 runs, then per run: u16 cells + pen */
 };
 
@@ -59,6 +60,7 @@ INTERNAL void vterm_scrollback_clear(VTermScrollback *sb)
   free_blocks(sb);
   sb->head = sb->count = 0;
   sb->bytes = 0;
+  sb->max_cols = 0;
 }
 
 INTERNAL void vterm_scrollback_free(VTermScrollback *sb)
@@ -208,7 +210,7 @@ static uint8_t *alloc_record(VTermScrollback *sb, size_t len)
   return rec;
 }
 
-INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, int cols, const ScreenPen *pens, bool trim, bool continuation)
+INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, int cols, const ScreenPen *pens, bool trim, bool continuation, unsigned marks)
 {
   if(!sb->max_lines)
     return;
@@ -218,6 +220,8 @@ INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, 
       cols--;
   if(cols > 0xFFFF)
     cols = 0xFFFF;
+  if(cols > sb->max_cols)
+    sb->max_cols = cols;
 
   size_t need = max_record(cols);
   if(need > sb->scratch_cap) {
@@ -228,7 +232,7 @@ INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, 
 
   uint8_t *rec = sb->scratch;
   uint8_t *p = rec + SB_HDR;
-  uint8_t flags = continuation ? SB_CONTINUATION : 0;
+  uint8_t flags = (continuation ? SB_CONTINUATION : 0) | (uint8_t)((marks & 7) << SB_MARKS_SHIFT);
 
   /* pens: find the runs first, they are small compared to the text */
   int nruns = 0;
@@ -304,6 +308,31 @@ INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, 
   sb->pushed++;
 
   enforce_limits(sb);
+}
+
+INTERNAL void vterm_scrollback_copy_row(VTermScrollback *dst, const VTermScrollback *src, size_t idx)
+{
+  if(!dst->max_lines)
+    return;
+
+  const uint8_t *rec = line_at(src, idx);
+  uint32_t len = record_len(rec);
+  uint16_t cols;
+  memcpy(&cols, rec + 4, 2);
+
+  if(dst->count == dst->index_cap)
+    grow_index(dst);
+
+  uint8_t *p = alloc_record(dst, len);
+  memcpy(p, rec, len);
+  dst->index[(dst->head + dst->count) & (dst->index_cap - 1)] = p;
+  dst->count++;
+  dst->bytes += len;
+  dst->pushed++;
+  if(cols > dst->max_cols)
+    dst->max_cols = cols;
+
+  enforce_limits(dst);
 }
 
 static int expand(const VTermScrollback *sb, const uint8_t *rec, VTermScreenCell *cells, int maxcols, int global_reverse, bool *continuation)
@@ -443,6 +472,22 @@ INTERNAL int vterm_scrollback_pop(VTermScrollback *sb, VTermScreenCell *cells, i
     b->used = (size_t)(rec - b->data);
 
   return n;
+}
+
+INTERNAL unsigned vterm_scrollback_marks_at(const VTermScrollback *sb, size_t idx)
+{
+  if(idx >= sb->count)
+    return 0;
+  return (line_at(sb, idx)[6] >> SB_MARKS_SHIFT) & 7;
+}
+
+INTERNAL int vterm_scrollback_cols_at(const VTermScrollback *sb, size_t idx)
+{
+  if(idx >= sb->count)
+    return 0;
+  uint16_t cols;
+  memcpy(&cols, line_at(sb, idx) + 4, 2);
+  return cols;
 }
 
 INTERNAL int vterm_scrollback_newest_cols(const VTermScrollback *sb)

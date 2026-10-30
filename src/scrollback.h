@@ -34,6 +34,9 @@ typedef struct
   bool default_pen_valid;
 
   uint64_t pushed, popped;
+
+  /* No stored row has more cells than this. An upper bound: it only comes down when the store is rebuilt */
+  int max_cols;
 } VTermScrollback;
 
 INTERNAL void vterm_scrollback_init(VTermScrollback *sb, VTerm *vt);
@@ -42,13 +45,22 @@ INTERNAL void vterm_scrollback_set_limits(VTermScrollback *sb, size_t max_lines,
 INTERNAL void vterm_scrollback_clear(VTermScrollback *sb);
 
 /* Stores `cols` cells of a row; trailing blank cells are dropped when `trim` */
-INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, int cols, const ScreenPen *pens, bool trim, bool continuation);
+INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, int cols, const ScreenPen *pens, bool trim, bool continuation, unsigned marks);
+
+/* Appends a copy of row `idx` of `src` to `dst`, as it is stored: no expanding and packing again */
+INTERNAL void vterm_scrollback_copy_row(VTermScrollback *dst, const VTermScrollback *src, size_t idx);
 
 /* Expands row `idx` (0 = oldest); returns the number of cells written, at most maxcols */
 INTERNAL int vterm_scrollback_get(const VTermScrollback *sb, size_t idx, VTermScreenCell *cells, int maxcols, int global_reverse, bool *continuation);
 
 /* Removes the newest row and expands it like vterm_scrollback_get; -1 if empty */
 INTERNAL int vterm_scrollback_pop(VTermScrollback *sb, VTermScreenCell *cells, int maxcols, int global_reverse, bool *continuation);
+
+/* Number of cells stored for a row (0 if idx is out of range) */
+INTERNAL int vterm_scrollback_cols_at(const VTermScrollback *sb, size_t idx);
+
+/* VTERM_LINEMARK_* bits of a row, 0 if idx is out of range */
+INTERNAL unsigned vterm_scrollback_marks_at(const VTermScrollback *sb, size_t idx);
 
 /* Number of cells stored for the newest row (0 if empty) */
 INTERNAL int vterm_scrollback_newest_cols(const VTermScrollback *sb);

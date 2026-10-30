@@ -429,12 +429,12 @@ static inline bool sb_wanted(const VTermScreen *screen)
 /* `rowstart` is the first cell of a row of the primary screen. It is passed in,
  * not looked up, because a resize pushes rows of the primary screen while the
  * alternate one may be the active one. */
-static void sb_pushline_from_row(VTermScreen *screen, const ScreenCell *rowstart, bool continuation)
+static void sb_pushline_from_row(VTermScreen *screen, const ScreenCell *rowstart, bool continuation, unsigned marks)
 {
   int cols = screen->cols;
 
   if(screen->sb.max_lines) {
-    vterm_scrollback_push(&screen->sb, rowstart, cols, screen->pens, !screen->global_reverse, continuation);
+    vterm_scrollback_push(&screen->sb, rowstart, cols, screen->pens, !screen->global_reverse, continuation, marks);
     return;
   }
 
@@ -461,7 +461,7 @@ static int premove(VTermRect rect, void *user)
      screen->buffer == screen->buffers[BUFIDX_PRIMARY]) { // not altscreen
     for(int row = 0; row < rect.end_row; row++) {
       const VTermLineInfo *lineinfo = vterm_state_get_lineinfo(screen->state, row);
-      sb_pushline_from_row(screen, screen->row_ptrs_active[row], lineinfo->continuation);
+      sb_pushline_from_row(screen, screen->row_ptrs_active[row], lineinfo->continuation, lineinfo->marks);
     }
   }
 
@@ -913,6 +913,7 @@ typedef struct
 {
   ScreenCell *cells;
   int n;
+  unsigned marks; /* of all its rows: they go on the first row of the line */
 } PulledLine;
 
 /* Takes whole logical lines off the end of the library scrollback, newest first, and returns them
@@ -932,9 +933,11 @@ static int pull_scrollback(VTermScreen *screen, int old_cols, int new_cols, int 
     ScreenCell **rows = NULL;
     int *rowlen = NULL;
     int nrows = 0, rcap = 0, len = 0;
+    unsigned marks = 0;
     bool cont;
     do {
       int cols = vterm_scrollback_newest_cols(sb);
+      marks |= vterm_scrollback_marks_at(sb, sb->count - 1);
       VTermScreenCell *tmp = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * (cols ? cols : 1));
       int n = vterm_scrollback_pop(sb, tmp, cols, screen->global_reverse, &cont);
       if(n < 0)
@@ -962,6 +965,7 @@ static int pull_scrollback(VTermScreen *screen, int old_cols, int new_cols, int 
 
     PulledLine line;
     line.n = len;
+    line.marks = marks;
     line.cells = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * (len ? len : 1));
     int at = len;
     for(int r = 0; r < nrows; r++) { /* newest row first: fill from the back */
@@ -1000,6 +1004,7 @@ static int pull_scrollback(VTermScreen *screen, int old_cols, int new_cols, int 
         info[row + r] = (VTermLineInfo){ 0 };
         info[row + r].continuation = r > 0;
       }
+      info[row].marks = lines[i].marks;
       row += nr;
     }
   }
@@ -1089,8 +1094,11 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       old_row = 0;
     int old_row_start = old_row;
 
+    unsigned group_marks = 0;
     int width = 0;
     for(int row = old_row_start; row <= old_row_end; row++) {
+      if(old_lineinfo)
+        group_marks |= old_lineinfo[row].marks;
       if(reflow && row < (rows_ext - 1) && old_lineinfo[row + 1].continuation)
         width += old_cols;
       else
@@ -1172,6 +1180,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       }
       for(new_row = new_row_start; new_row <= new_row_end; new_row++)
         new_lineinfo[new_row].continuation = (new_row > new_row_start);
+      new_lineinfo[new_row_start].marks = group_marks;
 
       old_row = old_row_start - 1;
       new_row = new_row_start - 1;
@@ -1218,6 +1227,8 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       }
 
       new_lineinfo[new_row].continuation = (new_row > new_row_start);
+      if(new_row == new_row_start)
+        new_lineinfo[new_row].marks = group_marks;
     }
 
     old_row = old_row_start - 1;
@@ -1247,7 +1258,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
     if(sb_wanted(screen))
       for(int row = 0; row <= old_row; row++) {
         const VTermLineInfo *lineinfo = old_lineinfo + row;
-        sb_pushline_from_row(screen, old_buffer + (size_t)row * old_cols, lineinfo->continuation);
+        sb_pushline_from_row(screen, old_buffer + (size_t)row * old_cols, lineinfo->continuation, lineinfo->marks);
       }
     if(active)
       statefields->pos.row -= (old_row + 1);
@@ -1256,7 +1267,9 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       (screen->sb.max_lines || (screen->callbacks && screen->callbacks->sb_popline))) {
     /* Try to backfill rows by popping scrollback buffer */
     while(new_row >= 0) {
+      unsigned popped_marks = 0;
       if(screen->sb.max_lines) {
+        popped_marks = vterm_scrollback_marks_at(&screen->sb, screen->sb.count - 1);
         int n = vterm_scrollback_pop(&screen->sb, screen->sb_buffer, old_cols, screen->global_reverse, NULL);
         if(n < 0)
           break;
@@ -1284,6 +1297,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
       }
       for( ; pos.col < new_cols; pos.col++)
         clearcell(screen, &new_buffer[pos.row * new_cols + pos.col]);
+      new_lineinfo[new_row].marks = popped_marks;
       new_row--;
 
       if(active)
@@ -1903,6 +1917,98 @@ int vterm_screen_scrollback_get(const VTermScreen *screen, size_t idx, VTermScre
 {
   int n = vterm_scrollback_get(&screen->sb, idx, cells, maxcols, screen->global_reverse, continuation);
   return n < 0 ? 0 : n;
+}
+
+int vterm_screen_scrollback_width(const VTermScreen *screen, size_t idx)
+{
+  return vterm_scrollback_cols_at(&screen->sb, idx);
+}
+
+/* Rows of the history that are wider than the screen are cut into rows of the screen's width: a row
+ * keeps the width it had when it scrolled off, and without this the part past the right edge is out
+ * of sight (a resize only re-wraps the history it pulls back onto the screen). Only the rows that are
+ * too wide are unpacked; the others are copied as stored. Costs a pass over the whole history, so it
+ * is for the end of a resize, not for every step of one; it does nothing when no row is too wide. */
+int vterm_screen_rewrap_scrollback(VTermScreen *screen)
+{
+  VTermScrollback *sb = &screen->sb;
+  const int cols = screen->cols;
+  if(!sb->max_lines || !sb->count || sb->max_cols <= cols)
+    return 0;
+
+  /* max_cols is only an upper bound (it does not come down as rows scroll out): look at the real widths
+   * first, it takes well under a millisecond, and leave the store alone if nothing is too wide */
+  int widest = 0;
+  for(size_t i = 0; i < sb->count; i++) {
+    int w = vterm_scrollback_cols_at(sb, i);
+    if(w > widest)
+      widest = w;
+  }
+  sb->max_cols = widest;
+  if(widest <= cols)
+    return 0;
+
+  const size_t old_count = sb->count;
+  int rows_cut = 0; /* how many history rows were wider than the screen */
+  VTermScrollback nsb;
+  vterm_scrollback_init(&nsb, screen->vt);
+  vterm_scrollback_set_limits(&nsb, sb->max_lines, sb->max_bytes);
+  nsb.default_pen = sb->default_pen;
+  nsb.default_pen_valid = sb->default_pen_valid;
+
+  screen->pen_gc_lock++; /* the cells below are not in a buffer the collector looks at */
+  VTermScreenCell *pub = vterm_allocator_malloc(screen->vt, sizeof(VTermScreenCell) * sb->max_cols);
+  ScreenCell *src = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * sb->max_cols);
+  ScreenCell *out = NULL;
+  size_t out_cap = 0;
+
+  for(size_t i = 0; i < old_count; i++) {
+    int width = vterm_scrollback_cols_at(sb, i);
+    if(width <= cols) {
+      vterm_scrollback_copy_row(&nsb, sb, i);
+      continue;
+    }
+
+    rows_cut++;
+    bool continuation = false;
+    unsigned marks = vterm_scrollback_marks_at(sb, i);
+    int n = vterm_scrollback_get(sb, i, pub, width, screen->global_reverse, &continuation);
+    if(n < 0)
+      n = 0;
+    for(int c = 0; c < n; c++)
+      cell_from_public(screen, &src[c], &pub[c]);
+
+    int nrows = reflow_run(screen, src, n, 0, cols, NULL, -1, NULL, NULL);
+    size_t need = (size_t)nrows * cols;
+    if(need > out_cap) {
+      vterm_allocator_free(screen->vt, out);
+      out = vterm_allocator_malloc(screen->vt, sizeof(ScreenCell) * need);
+      out_cap = need;
+    }
+    reflow_run(screen, src, n, 0, cols, out, -1, NULL, NULL);
+    /* the first piece is the row as it was (it may continue the line above); the marks stay on it */
+    for(int r = 0; r < nrows; r++)
+      vterm_scrollback_push(&nsb, out + (size_t)r * cols, cols, screen->pens, !screen->global_reverse,
+          continuation || r > 0, r == 0 ? marks : 0);
+  }
+
+  vterm_allocator_free(screen->vt, pub);
+  vterm_allocator_free(screen->vt, src);
+  vterm_allocator_free(screen->vt, out);
+  screen->pen_gc_lock--;
+
+  /* Count it as the rows being replaced by the new ones: what was pushed and not popped before, and
+   * not held any more (dropped to the limit), stays what it was */
+  nsb.popped = sb->popped;
+  nsb.pushed = (sb->pushed - old_count) + nsb.pushed;
+  vterm_scrollback_free(sb);
+  *sb = nsb;
+  return rows_cut;
+}
+
+unsigned vterm_screen_scrollback_marks(const VTermScreen *screen, size_t idx)
+{
+  return vterm_scrollback_marks_at(&screen->sb, idx);
 }
 
 void vterm_screen_scrollback_clear(VTermScreen *screen)

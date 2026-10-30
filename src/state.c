@@ -44,6 +44,11 @@ static void updatecursor(VTermState *state, VTermPos *oldpos, int cancel_phantom
 
 static void erase(VTermState *state, VTermRect rect, int selective)
 {
+  /* only after a program has sent OSC 133: before that no row has a mark */
+  if(state->osc133_seen && rect.start_col == 0 && rect.end_col == state->cols)
+    for(int row = rect.start_row; row < rect.end_row && row < state->rows; row++)
+      state->lineinfo[row].marks = 0;
+
   if(rect.end_col == state->cols) {
     /* If we're erasing the final cells of any lines, cancel the continuation
      * marker on the subsequent line
@@ -86,6 +91,7 @@ static VTermState *vterm_state_new(VTerm *vt)
   state->osc8_buf = NULL;
   state->osc8_len = 0;
   state->osc8_overflow = false;
+  state->osc133_seen = false;
   state->pen.link = 0;
 
   vterm_state_newpen(state);
@@ -2219,6 +2225,17 @@ static int on_osc(int command, VTermStringFragment frag, void *user)
 
     case 8:
       osc_hyperlink(state, frag);
+      return 1;
+
+    case 133:
+      /* Shell integration: only the kind of mark matters (A prompt, C output, D done) */
+      if(frag.initial && frag.len && !state->mode.alt_screen) {
+        state->osc133_seen = true;
+        unsigned mark = frag.str[0] == 'A' ? VTERM_LINEMARK_PROMPT
+                      : frag.str[0] == 'C' ? VTERM_LINEMARK_OUTPUT
+                      : frag.str[0] == 'D' ? VTERM_LINEMARK_DONE : 0;
+        state->lineinfo[state->pos.row].marks |= mark;
+      }
       return 1;
 
     case 52:
