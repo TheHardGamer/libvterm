@@ -171,16 +171,6 @@ static inline const uint8_t *get_utf8(const uint8_t *p, const uint8_t *end, uint
   return p;
 }
 
-/* A trailing cell that shows nothing: no character, default background, and no
- * attribute that draws on an empty cell. */
-static inline bool blank_tail(const ScreenCell *cell, const ScreenPen *pens)
-{
-  const ScreenPen *pen = &pens[cell->pen];
-  return cell->chars[0] == 0 &&
-         VTERM_COLOR_IS_DEFAULT_BG(&pen->bg) &&
-         !pen->reverse && !pen->underline && !pen->strike;
-}
-
 /* Worst case size of the record for `cols` cells */
 static size_t max_record(int cols)
 {
@@ -215,9 +205,24 @@ INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, 
   if(!sb->max_lines)
     return;
 
-  if(trim)
-    while(cols > 0 && blank_tail(row + cols - 1, pens))
+  if(trim) {
+    /* Trailing blanks nearly all have the same pen, so what it says about the pen is asked once */
+    uint32_t pen_seen = UINT32_MAX;
+    bool pen_blank = false;
+    while(cols > 0) {
+      const ScreenCell *cell = row + cols - 1;
+      if(cell->chars[0] != 0)
+        break;
+      if(cell->pen != pen_seen) {
+        const ScreenPen *pen = &pens[cell->pen];
+        pen_seen = cell->pen;
+        pen_blank = VTERM_COLOR_IS_DEFAULT_BG(&pen->bg) && !pen->reverse && !pen->underline && !pen->strike;
+      }
+      if(!pen_blank)
+        break;
       cols--;
+    }
+  }
   if(cols > 0xFFFF)
     cols = 0xFFFF;
   if(cols > sb->max_cols)
@@ -239,18 +244,16 @@ INTERNAL void vterm_scrollback_push(VTermScrollback *sb, const ScreenCell *row, 
   uint8_t *runs_at = p + 2;
   uint8_t *rp = runs_at;
   {
-    int start = 0;
-    for(int col = 1; col <= cols; col++) {
-      if(col == cols || row[col].pen != row[start].pen) {
-        if(cols > 0) {
-          uint16_t n = (uint16_t)(col - start);
-          memcpy(rp, &n, 2);
-          memcpy(rp + 2, &pens[row[start].pen], sizeof(ScreenPen));
-          rp += 2 + sizeof(ScreenPen);
-          nruns++;
-        }
-        start = col;
-      }
+    /* Runs of cells with the same pen: nearly always the whole row is one */
+    for(int start = 0, col; start < cols; start = col) {
+      const uint32_t pen_id = row[start].pen;
+      for(col = start + 1; col < cols && row[col].pen == pen_id; col++)
+        ;
+      uint16_t n = (uint16_t)(col - start);
+      memcpy(rp, &n, 2);
+      memcpy(rp + 2, &pens[pen_id], sizeof(ScreenPen));
+      rp += 2 + sizeof(ScreenPen);
+      nruns++;
     }
   }
 

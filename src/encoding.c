@@ -34,6 +34,14 @@ static void init_utf8(VTermEncoding *enc, void *data_)
 #define UTF8_ANY_LESS(x, n) (((x) - UTF8_ONES * (n)) & ~(x) & UTF8_ONES * 128)
 #define UTF8_ANY_MORE(x, n) ((((x) + UTF8_ONES * (127 - (n))) | (x)) & UTF8_ONES * 128)
 
+#if defined(__SSE2__) || defined(_M_X64)
+# include <emmintrin.h>
+# define HAVE_SSE2_ASCII 1
+# if defined(_MSC_VER)
+#  include <intrin.h>
+# endif
+#endif
+
 static void decode_utf8(VTermEncoding *enc, void *data_,
                         uint32_t cp[], int *cpi, int cplen,
                         const char bytes[], size_t *pos, size_t bytelen)
@@ -74,6 +82,37 @@ static void decode_utf8(VTermEncoding *enc, void *data_,
        * time. A window with a byte that is not printable ASCII still gives up the good bytes in front of it.
        * Only reached after an ASCII byte, so multi-byte text does not pay for it. */
       if(bytelen - *pos > 8 && (unsigned)(unsigned char)bytes[*pos + 1] - 0x20 < 0x5f) {
+#ifdef HAVE_SSE2_ASCII
+        /* The same, 16 at a time: widen the bytes to code points with unpacks and store them whole, then
+         * keep the ones before the first byte that is not printable ASCII (below 0x20, or 0x7f and up) */
+        const __m128i low = _mm_set1_epi8(0x1f), high = _mm_set1_epi8(0x7f), zero = _mm_setzero_si128();
+        while(bytelen - *pos > 16 && cplen - *cpi >= 16) {
+          const __m128i v = _mm_loadu_si128((const __m128i *)(bytes + *pos + 1));
+          const __m128i bad = _mm_or_si128(_mm_cmpeq_epi8(_mm_min_epu8(v, low), v), _mm_cmpeq_epi8(_mm_max_epu8(v, high), v));
+          const unsigned mask = (unsigned)_mm_movemask_epi8(bad);
+          const __m128i lo16 = _mm_unpacklo_epi8(v, zero), hi16 = _mm_unpackhi_epi8(v, zero);
+          __m128i *out = (__m128i *)(cp + *cpi);
+          _mm_storeu_si128(out + 0, _mm_unpacklo_epi16(lo16, zero));
+          _mm_storeu_si128(out + 1, _mm_unpackhi_epi16(lo16, zero));
+          _mm_storeu_si128(out + 2, _mm_unpacklo_epi16(hi16, zero));
+          _mm_storeu_si128(out + 3, _mm_unpackhi_epi16(hi16, zero));
+          /* cp has room for 16: all 16 are stored, `good` of them are kept */
+          int good = 16;
+          if(mask) {
+#if defined(_MSC_VER)
+            unsigned long bit;
+            _BitScanForward(&bit, mask);
+            good = (int)bit;
+#else
+            good = __builtin_ctz(mask);
+#endif
+          }
+          *pos += good;
+          *cpi += good;
+          if(good < 16)
+            break;
+        }
+#endif
         while(bytelen - *pos > 8 && cplen - *cpi >= 8) {
           uint64_t w;
           memcpy(&w, bytes + *pos + 1, 8);

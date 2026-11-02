@@ -486,6 +486,20 @@ static void rotate_row_ptrs(ScreenCell **row_ptrs, int start, int end, int k)
   if(n <= 0 || k <= 0 || k >= n)
     return;
 
+  /* A scroll by one line, up or down, is nearly every scroll there is: one move instead of three reversals */
+  if(k == 1) {
+    ScreenCell *first = row_ptrs[start];
+    memmove(row_ptrs + start, row_ptrs + start + 1, (size_t)(n - 1) * sizeof(*row_ptrs));
+    row_ptrs[end - 1] = first;
+    return;
+  }
+  if(k == n - 1) {
+    ScreenCell *last = row_ptrs[end - 1];
+    memmove(row_ptrs + start + 1, row_ptrs + start, (size_t)(n - 1) * sizeof(*row_ptrs));
+    row_ptrs[start] = last;
+    return;
+  }
+
   reverse_row_ptrs(row_ptrs, start, start + k);
   reverse_row_ptrs(row_ptrs, start + k, end);
   reverse_row_ptrs(row_ptrs, start, end);

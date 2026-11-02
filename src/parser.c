@@ -112,6 +112,53 @@ static void string_fragment(VTerm *vt, const char *str, size_t len, bool final)
   vt->parser.string_initial = false;
 }
 
+#if defined(__SSE2__) || defined(_M_X64)
+# include <emmintrin.h>
+# define HAVE_SSE2_SCAN 1
+# if defined(_MSC_VER)
+#  include <intrin.h>
+# endif
+#endif
+
+/* Index of the first byte at or after pos that ends or interrupts the body of a string: a control
+ * character, DEL, or (when C1 is in use) C1 ST. len if there is none. Strings can be megabytes of
+ * ordinary bytes, so where there is SSE2 this looks at 16 of them at a time. */
+static size_t string_body_end(const char *bytes, size_t len, size_t pos, bool c1_allowed)
+{
+#ifdef HAVE_SSE2_SCAN
+  const __m128i low = _mm_set1_epi8(0x1f);
+  const __m128i del = _mm_set1_epi8(0x7f);
+  const __m128i st  = _mm_set1_epi8((char)0x9c);
+  while(len - pos >= 16) {
+    const __m128i v = _mm_loadu_si128((const __m128i *)(bytes + pos));
+    /* v <= 0x1f as unsigned: the minimum with 0x1f is v itself */
+    __m128i stop = _mm_or_si128(_mm_cmpeq_epi8(_mm_min_epu8(v, low), v), _mm_cmpeq_epi8(v, del));
+    if(c1_allowed)
+      stop = _mm_or_si128(stop, _mm_cmpeq_epi8(v, st));
+    const unsigned mask = (unsigned)_mm_movemask_epi8(stop);
+    if(mask) {
+#if defined(_MSC_VER)
+      unsigned long bit;
+      _BitScanForward(&bit, mask);
+      return pos + bit;
+#else
+      return pos + (size_t)__builtin_ctz(mask);
+#endif
+    }
+    pos += 16;
+  }
+#endif
+  if(c1_allowed) {
+    while(pos < len && (unsigned char)bytes[pos] >= 0x20 && (unsigned char)bytes[pos] != 0x7f && (unsigned char)bytes[pos] != 0x9c)
+      pos++;
+  }
+  else {
+    while(pos < len && (unsigned char)bytes[pos] >= 0x20 && (unsigned char)bytes[pos] != 0x7f)
+      pos++;
+  }
+  return pos;
+}
+
 size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
 {
   size_t pos = 0;
@@ -204,15 +251,7 @@ size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
     else if(state_now == OSC || state_now == DCS || state_now == APC || state_now == PM || state_now == SOS) {
       /* The body of a string: nothing to do for ordinary bytes, so skip to the next one that
        * ends it or is special (a control character, DEL, or C1 ST when C1 is in use) */
-      size_t p = pos;
-      if(c1_allowed) {
-        while(p < len && (unsigned char)bytes[p] >= 0x20 && (unsigned char)bytes[p] != 0x7f && (unsigned char)bytes[p] != 0x9c)
-          p++;
-      }
-      else {
-        while(p < len && (unsigned char)bytes[p] >= 0x20 && (unsigned char)bytes[p] != 0x7f)
-          p++;
-      }
+      const size_t p = string_body_end(bytes, len, pos, c1_allowed);
       if(p >= len) {
         pos = len;
         break;
