@@ -229,7 +229,9 @@ size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
         else if(c == ';' || c == ':') {
           if(c == ':')
             args[argi] |= CSI_ARG_FLAG_MORE;
-          args[++argi] = CSI_ARG_MISSING;
+          /* Arguments beyond CSI_ARGS_MAX are dropped, not stored */
+          if(argi < CSI_ARGS_MAX - 1)
+            args[++argi] = CSI_ARG_MISSING;
         }
         else
           break;
@@ -360,8 +362,11 @@ size_t vterm_input_write(VTerm *vt, const char *bytes, size_t len)
         c = ';';
       }
       if(c == ';') {
-        vt->parser.v.csi.argi++;
-        vt->parser.v.csi.args[vt->parser.v.csi.argi] = CSI_ARG_MISSING;
+        /* Arguments beyond CSI_ARGS_MAX are dropped, not stored */
+        if(vt->parser.v.csi.argi < CSI_ARGS_MAX - 1) {
+          vt->parser.v.csi.argi++;
+          vt->parser.v.csi.args[vt->parser.v.csi.argi] = CSI_ARG_MISSING;
+        }
         break;
       }
 
@@ -507,7 +512,7 @@ string_state:
 
   if(string_start) {
     size_t string_len = bytes + pos - string_start;
-    if(vt->parser.in_esc)
+    if(vt->parser.in_esc && string_len > 0)
       string_len -= 1;
     string_fragment(vt, string_start, string_len, false);
   }
